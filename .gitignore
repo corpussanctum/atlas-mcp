@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.test-dist/
+.env
+*.jsonl
+issuer.json
+.atlas-mcp/
+.mcp.json

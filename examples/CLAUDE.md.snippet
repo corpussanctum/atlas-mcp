@@ -1,0 +1,11 @@
+## Atlas authorization (required)
+
+Before any destructive, production, deploy, credential or spending action:
+
+1. Call `atlas_authorize` with agent `agent:claude`, principal `user:YOU`,
+   delegation_chain `["grt_XXXXXXXXXXXX"]`, the requested_action (e.g. `db.delete`)
+   and EVERY effect (type, resource, environment).
+2. Proceed only if decision is `permit`. On `deny`, stop and tell the user the reason.
+   On `escalate`, tell the user to run `atlas-mcp resolve <receipt_id> approve`,
+   then poll `atlas_receipt_status` until `ready`.
+3. After acting, call `atlas_commit_effect` with what actually happened.

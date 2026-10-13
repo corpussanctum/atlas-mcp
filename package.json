@@ -1,0 +1,28 @@
+{
+  "name": "atlas-mcp",
+  "version": "0.1.0",
+  "description": "Pre-action authorization for AI agents, as an MCP server. Permit / deny / escalate against a signed delegation chain, with post-quantum signed receipts.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": { "atlas-mcp": "dist/index.js" },
+  "files": ["dist", "README.md", "LICENSE", "server.json"],
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc -p tsconfig.tests.json && node --test .test-dist/tests/*.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["mcp", "model-context-protocol", "agent", "authorization", "delegation", "audit", "claude-code", "security", "post-quantum"],
+  "author": "TJ Lane <tj@corpussanctum.ai>",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/corpussanctum/atlas-mcp.git" },
+  "mcpName": "io.github.corpussanctum/atlas-mcp",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.3.1",
+    "@noble/post-quantum": "^0.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
