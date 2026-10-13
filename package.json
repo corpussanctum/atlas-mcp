@@ -1,11 +1,11 @@
 {
   "name": "@corpussanctum/atlas-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pre-action authorization for AI agents, as an MCP server. Permit / deny / escalate against a signed delegation chain, with post-quantum signed receipts.",
   "type": "module",
   "main": "dist/index.js",
   "bin": { "atlas-mcp": "dist/index.js" },
-  "files": ["dist", "README.md", "LICENSE", "server.json"],
+  "files": ["dist", "README.md", "PRIVACY.md", "LICENSE", "server.json"],
   "scripts": {
     "build": "tsc",
     "test": "tsc -p tsconfig.tests.json && node --test .test-dist/tests/*.test.js",

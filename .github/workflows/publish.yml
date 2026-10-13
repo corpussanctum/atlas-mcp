@@ -1,0 +1,21 @@
+name: Publish
+on:
+  push: { tags: ["v*"] }
+permissions: { contents: read }
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, registry-url: "https://registry.npmjs.org", cache: npm }
+      - run: npm ci
+      - run: npm test
+      - name: Tag must match package.json and server.json
+        run: |
+          v="$(node -p "require('./package.json').version")"
+          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag $GITHUB_REF_NAME != package.json $v"; exit 1; }
+          [ "$(node -p "require('./server.json').version")" = "$v" ] || { echo "server.json version mismatch"; exit 1; }
+      - run: npm publish --provenance --access public
+        env: { NODE_AUTH_TOKEN: "${{ secrets.NPM_TOKEN }}" }

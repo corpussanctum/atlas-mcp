@@ -18,6 +18,7 @@ const effectSchema: Record<string, any> = {
 export const toolDefinitions: Tool[] = [
   {
     name: "atlas_authorize",
+    title: "Authorize Action",
     description:
       "Ask for authorization BEFORE doing anything consequential (deleting data, deploying, spending, sending). " +
       "Atlas checks the action and its effects against the signed delegation chain and returns permit, deny or escalate with a receipt_id. " +
@@ -41,6 +42,7 @@ export const toolDefinitions: Tool[] = [
   },
   {
     name: "atlas_commit_effect",
+    title: "Report Completed Effects",
     description:
       "After acting on a permitted receipt, report what was actually done. Atlas records it in the signed audit log and flags any effect the receipt did not cover. One commit per receipt.",
     inputSchema: {
@@ -57,6 +59,7 @@ export const toolDefinitions: Tool[] = [
   },
   {
     name: "atlas_receipt_status",
+    title: "Check Receipt Status",
     description:
       "Check a receipt: ready, pending_approval (escalated, waiting for a human), rejected, denied, committed or expired. " +
       "Approval can only be given by a human through the atlas-mcp CLI, never through this server.",
@@ -65,6 +68,7 @@ export const toolDefinitions: Tool[] = [
   },
   {
     name: "atlas_verify_audit",
+    title: "Verify Audit Log",
     description: "Verify the audit log's SHA3-256 hash chain and ML-DSA-65 signatures. Reports the first broken entry, if any.",
     inputSchema: { type: "object", properties: {} },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },

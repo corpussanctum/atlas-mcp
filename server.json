@@ -3,8 +3,8 @@
   "name": "io.github.corpussanctum/atlas-mcp",
   "description": "Pre-action authorization for AI agents: permit, deny or escalate against a signed delegation chain.",
   "repository": { "url": "https://github.com/corpussanctum/atlas-mcp", "source": "github" },
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packages": [
-    { "registryType": "npm", "identifier": "@corpussanctum/atlas-mcp", "version": "0.1.0", "transport": { "type": "stdio" } }
+    { "registryType": "npm", "identifier": "@corpussanctum/atlas-mcp", "version": "0.1.1", "transport": { "type": "stdio" } }
   ]
 }
