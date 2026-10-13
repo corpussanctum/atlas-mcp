@@ -123,7 +123,7 @@ Edit `~/.atlas-mcp/hook.json`:
 * **Classification is pattern matching.** A command Atlas doesn't recognise is plain `shell.exec`, and environment is inferred from words in the command (`prod`, `production`, `staging`). `./deploy.sh` or a connection string with no environment word passes as `dev`. Add `rules` and `environments` for your own tooling. This is a speed bump against mistakes and a record for audit, not a defence against an agent actively hiding its intent.
 * **Effects are as classified, not observed.** The audit log records what Atlas judged the call would do, not what the process really did.
 * **Hook failures.** The hook answers `deny` when it can catch its own error (missing config, bad grant). A hard crash or timeout is not blocked by Claude Code unless your build supports `"onFailure": "block"` on the hook handler (documented for recent versions); add it to both hook entries if yours does.
-* **Permission modes.** Whether a hook `deny` holds under `--permission-mode bypassPermissions` is not stated in Claude Code's docs. Test it on your build before relying on it there.
+* **Permission modes.** Claude Code's docs don't say whether a hook `deny` survives `--permission-mode bypassPermissions`. We tested it on Claude Code 2.1.296 (Claude Code): a denied command did not run under `bypassPermissions` (the control command ran and was committed). Retest after upgrading Claude Code.
 * **Self-protection is partial.** Edits to `~/.atlas-mcp` and commands that name it are refused, but a shell can reach a file by many routes. Run agents as a different OS user from the one that owns the data directory if that matters to you.
 * Claude Code only. Other clients need their own enforcement point.
 
