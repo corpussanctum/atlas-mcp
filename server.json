@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.corpussanctum/atlas-mcp",
-  "description": "Pre-action authorization for AI agents: permit/deny/escalate against a signed delegation chain, with signed receipts.",
+  "description": "Pre-action authorization for AI agents: permit, deny or escalate against a signed delegation chain.",
   "repository": { "url": "https://github.com/corpussanctum/atlas-mcp", "source": "github" },
   "version": "0.1.0",
   "packages": [
