@@ -7,10 +7,10 @@ Before an agent deletes data, deploys, or spends money, it asks Atlas. Atlas che
 ```
 $ npx -y @corpussanctum/atlas-mcp demo
 
-  You (tj) delegate to claude: database work in STAGING only.
+  You (alice) delegate to claude: database work in STAGING only.
 
   Claude: delete rows in staging
-    -> PERMIT    rcpt_ec14…  authorized by 1-link delegation chain from user:tj
+    -> PERMIT    rcpt_ec14…  authorized by 1-link delegation chain from user:alice
 
   Claude: delete rows in PRODUCTION
     -> DENY      rcpt_876f…  effect targets environment 'production';
@@ -43,14 +43,14 @@ args = ["-y", "@corpussanctum/atlas-mcp"]
 
 **2. Delegate authority.** You, the principal, issue a grant to the agent:
 ```bash
-npx -y @corpussanctum/atlas-mcp grant --principal user:tj --subject agent:claude \
+npx -y @corpussanctum/atlas-mcp grant --principal user:alice --subject agent:claude \
   --allow 'db.*' --env staging --escalate db.write --ttl-hours 8
 # prints the grant JSON; note its "id" (grt_…)
 ```
 
 **3. Tell the agent the rules.** Add to `CLAUDE.md` / `AGENTS.md` (see [`examples/CLAUDE.md.snippet`](examples/CLAUDE.md.snippet)):
 
-> Before any destructive, production, deploy or spending action, call `atlas_authorize` with agent `agent:claude`, principal `user:tj`, delegation_chain `["grt_…"]`, the action and every effect. Proceed only on `permit`. Afterwards call `atlas_commit_effect`.
+> Before any destructive, production, deploy or spending action, call `atlas_authorize` with agent `agent:claude`, principal `user:alice`, delegation_chain `["grt_…"]`, the action and every effect. Proceed only on `permit`. Afterwards call `atlas_commit_effect`.
 
 **4. Approve escalations as the human.** Approval is deliberately **not** an MCP tool, so an agent cannot approve itself:
 ```bash

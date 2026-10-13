@@ -91,16 +91,16 @@ function demo(): number {
   try {
     const { issuer, log, engine } = open(dir);
     const say = (s: string) => console.log(s);
-    say("\n  You (tj) delegate to claude: database work in STAGING only; deletes need no one else.\n");
+    say("\n  You (alice) delegate to claude: database work in STAGING only; deletes need no one else.\n");
     const g = issueGrant(issuer, log, {
-      grantor: "user:tj", subject: "agent:claude",
+      grantor: "user:alice", subject: "agent:claude",
       scope: { allow: ["db.read", "db.write", "db.delete"], environments: ["staging"], escalate: ["db.write"] }, ttlHours: 8,
     });
     say(`  grant ${g.id}: allow db.read/db.write/db.delete @ staging, db.write needs approval\n`);
 
     const ask = (label: string, action: string, environment: string) => {
       const r = engine.authorize({
-        agent: "agent:claude", principal: "user:tj", requested_action: action,
+        agent: "agent:claude", principal: "user:alice", requested_action: action,
         effects: [{ type: action.split(".")[1], resource: `postgres://${environment}/users`, environment, irreversible: action === "db.delete" }],
         delegation_chain: [g.id],
       });
@@ -112,7 +112,7 @@ function demo(): number {
     ask("Claude: delete rows in PRODUCTION", "db.delete", "production");
     const esc = ask("Claude: write to staging", "db.write", "staging");
     say(`  human approves:  atlas-mcp resolve ${esc.receipt_id} approve\n`);
-    engine.resolve(esc.receipt_id, "approve", "tj");
+    engine.resolve(esc.receipt_id, "approve", "alice");
     say(`  receipt state now: ${engine.status(esc.receipt_id).state}\n`);
     say(`  audit log: ${JSON.stringify(log.verify())}\n`);
     return 0;
