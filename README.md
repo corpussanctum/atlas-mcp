@@ -5,7 +5,7 @@
 Before an agent deletes data, deploys, or spends money, it asks Atlas. Atlas checks the request against a **signed delegation chain** and answers `permit`, `deny` or `escalate`, with a receipt. After acting, the agent reports what really happened with `atlas_commit_effect`. Every step lands in a hash-chained, ML-DSA-65-signed audit log.
 
 ```
-$ npx atlas-mcp demo
+$ npx -y @corpussanctum/atlas-mcp demo
 
   You (tj) delegate to claude: database work in STAGING only.
 
@@ -26,24 +26,24 @@ $ npx atlas-mcp demo
 
 Claude Code:
 ```bash
-claude mcp add atlas -- npx -y atlas-mcp
+claude mcp add atlas -- npx -y @corpussanctum/atlas-mcp
 ```
 
 Claude Desktop (`claude_desktop_config.json`), or any MCP client:
 ```json
-{ "mcpServers": { "atlas": { "command": "npx", "args": ["-y", "atlas-mcp"] } } }
+{ "mcpServers": { "atlas": { "command": "npx", "args": ["-y", "@corpussanctum/atlas-mcp"] } } }
 ```
 
 Codex (`~/.codex/config.toml`):
 ```toml
 [mcp_servers.atlas]
 command = "npx"
-args = ["-y", "atlas-mcp"]
+args = ["-y", "@corpussanctum/atlas-mcp"]
 ```
 
 **2. Delegate authority.** You, the principal, issue a grant to the agent:
 ```bash
-npx atlas-mcp grant --principal user:tj --subject agent:claude \
+npx -y @corpussanctum/atlas-mcp grant --principal user:tj --subject agent:claude \
   --allow 'db.*' --env staging --escalate db.write --ttl-hours 8
 # prints the grant JSON; note its "id" (grt_…)
 ```
@@ -54,8 +54,8 @@ npx atlas-mcp grant --principal user:tj --subject agent:claude \
 
 **4. Approve escalations as the human.** Approval is deliberately **not** an MCP tool, so an agent cannot approve itself:
 ```bash
-npx atlas-mcp resolve rcpt_a8d7… approve
-npx atlas-mcp verify            # check the audit chain and signatures
+npx -y @corpussanctum/atlas-mcp resolve rcpt_a8d7… approve
+npx -y @corpussanctum/atlas-mcp verify            # check the audit chain and signatures
 ```
 
 ## Tools

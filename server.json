@@ -5,6 +5,6 @@
   "repository": { "url": "https://github.com/corpussanctum/atlas-mcp", "source": "github" },
   "version": "0.1.0",
   "packages": [
-    { "registryType": "npm", "identifier": "atlas-mcp", "version": "0.1.0", "transport": { "type": "stdio" } }
+    { "registryType": "npm", "identifier": "@corpussanctum/atlas-mcp", "version": "0.1.0", "transport": { "type": "stdio" } }
   ]
 }

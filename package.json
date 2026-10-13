@@ -1,5 +1,5 @@
 {
-  "name": "atlas-mcp",
+  "name": "@corpussanctum/atlas-mcp",
   "version": "0.1.0",
   "description": "Pre-action authorization for AI agents, as an MCP server. Permit / deny / escalate against a signed delegation chain, with post-quantum signed receipts.",
   "type": "module",
@@ -14,6 +14,7 @@
   "keywords": ["mcp", "model-context-protocol", "agent", "authorization", "delegation", "audit", "claude-code", "security", "post-quantum"],
   "author": "TJ Lane <tj@corpussanctum.ai>",
   "license": "Apache-2.0",
+  "publishConfig": { "access": "public" },
   "repository": { "type": "git", "url": "https://github.com/corpussanctum/atlas-mcp.git" },
   "mcpName": "io.github.corpussanctum/atlas-mcp",
   "engines": { "node": ">=20" },
