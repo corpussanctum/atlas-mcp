@@ -10,6 +10,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 22, registry-url: "https://registry.npmjs.org", cache: npm }
+      - name: npm >= 11.5.1 is required for trusted publishing
+        run: npm install -g npm@latest
       - run: npm ci
       - run: npm test
       - name: Tag must match package.json and server.json
@@ -17,5 +19,5 @@ jobs:
           v="$(node -p "require('./package.json').version")"
           [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag $GITHUB_REF_NAME != package.json $v"; exit 1; }
           [ "$(node -p "require('./server.json').version")" = "$v" ] || { echo "server.json version mismatch"; exit 1; }
+      # Authenticates via OIDC (npm Trusted Publisher); no npm token is stored anywhere.
       - run: npm publish --provenance --access public
-        env: { NODE_AUTH_TOKEN: "${{ secrets.NPM_TOKEN }}" }

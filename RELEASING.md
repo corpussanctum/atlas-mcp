@@ -12,6 +12,6 @@
 
 ## One-time setup
 
-- Add an npm automation token (publish scope for `@corpussanctum/atlas-mcp`) as the repo secret `NPM_TOKEN`.
+- Configure an npm **Trusted Publisher** (no token is stored): npmjs.com > `@corpussanctum/atlas-mcp` > Settings > Trusted Publisher > GitHub Actions, with organization `corpussanctum`, repository `atlas-mcp`, workflow filename `publish.yml`, environment blank.
 - Repo settings > Code security: enable secret scanning and push protection (free for public repos). Optionally Dependabot alerts.
 - CodeQL runs from `.github/workflows/codeql.yml` (push, PR, weekly).
