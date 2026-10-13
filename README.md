@@ -75,9 +75,61 @@ npx -y @corpussanctum/atlas-mcp verify            # check the audit chain and si
 * **Fail closed:** unknown grants, bad signatures, missing environments under an environment-restricted grant, and malformed requests all deny. The server trusts its own recorded copy of a grant, never the caller's.
 * Receipts expire after 15 minutes. A permit/approval covers the stated effects only.
 
+## Enforce it: the Claude Code hook
+
+The MCP tools are a gate the agent *chooses* to call. The hook makes the check unskippable for Claude Code: it runs outside the model on every gated tool call, so the agent cannot forget, or talk its way past, a `deny`.
+
+```bash
+npm i -g @corpussanctum/atlas-mcp       # a global install avoids npx startup cost on every tool call
+atlas-mcp hook init --principal user:alice
+```
+
+`hook init` writes `~/.atlas-mcp/hook.json`, issues a starter grant (30 days; environments `dev` and `staging`; `shell.deploy` and `shell.delete` ask first), and prints the `settings.json` block to paste into `~/.claude/settings.json`.
+
+### What happens on each tool call
+
+| Claude Code tool call | Atlas action | Result |
+|---|---|---|
+| `npm test` in dev | `shell.exec` | no opinion: Claude Code's normal permissions apply |
+| `psql … production` | `shell.exec` @ production | **deny**: the delegated authority only permits dev, staging |
+| `rm -rf dist`, `git push --force`, `drop table` | `shell.delete` | **ask**: Claude Code prompts you; acceptance is recorded as the approval |
+| `kubectl apply`, `terraform apply`, `npm publish` | `shell.deploy` | **ask** |
+| `Write` / `Edit` / `MultiEdit` | `file.write` | by grant |
+| `mcp__server__tool` | `mcp.server.tool` | by grant |
+| `Read`, `Grep`, `Glob`, Atlas's own tools | not gated | |
+
+The `PostToolUse` hook then commits the receipt (success or failure) to the signed audit log. Check it any time with `atlas-mcp verify`.
+
+### Tuning
+
+Edit `~/.atlas-mcp/hook.json`:
+
+```json
+{
+  "agent": "agent:claude-code",
+  "principal": "user:alice",
+  "delegation_chain": ["grt_…"],
+  "default_environment": "dev",
+  "environments": [{ "match": "\\b(prod|production|live)\\b", "environment": "production" }],
+  "rules": [{ "tool": "^Bash$", "match": "^make release", "action": "shell.deploy", "effect_type": "deploy" }],
+  "on_permit": "defer"
+}
+```
+
+`on_permit: "allow"` lets an Atlas permit skip Claude Code's own prompt. The default, `defer`, keeps Claude Code's prompts as a second layer.
+
+### What it does not do (read this)
+
+* **Classification is pattern matching.** A command Atlas doesn't recognise is plain `shell.exec`, and environment is inferred from words in the command (`prod`, `production`, `staging`). `./deploy.sh` or a connection string with no environment word passes as `dev`. Add `rules` and `environments` for your own tooling. This is a speed bump against mistakes and a record for audit, not a defence against an agent actively hiding its intent.
+* **Effects are as classified, not observed.** The audit log records what Atlas judged the call would do, not what the process really did.
+* **Hook failures.** The hook answers `deny` when it can catch its own error (missing config, bad grant). A hard crash or timeout is not blocked by Claude Code unless your build supports `"onFailure": "block"` on the hook handler (documented for recent versions); add it to both hook entries if yours does.
+* **Permission modes.** Whether a hook `deny` holds under `--permission-mode bypassPermissions` is not stated in Claude Code's docs. Test it on your build before relying on it there.
+* **Self-protection is partial.** Edits to `~/.atlas-mcp` and commands that name it are refused, but a shell can reach a file by many routes. Run agents as a different OS user from the one that owns the data directory if that matters to you.
+* Claude Code only. Other clients need their own enforcement point.
+
 ## Read this before you rely on it
 
-* **This is a gate the agent consults, not a sandbox.** An MCP tool cannot stop an agent that decides not to call it, or that lies about its effects. v0.1 gives you a signed, verifiable record and a decision to enforce *with*: pair it with a Claude Code `PreToolUse` hook, a tool proxy, or network/credential isolation to make it binding. `atlas_commit_effect` catches and records the mismatches it is told about.
+* **This is a gate the agent consults, not a sandbox.** On its own, an MCP tool cannot stop an agent that decides not to call it, or that lies about its effects. v0.1 gives you a signed, verifiable record and a decision to enforce *with*: for Claude Code, use the hook above to make it binding; elsewhere pair it with a tool proxy or network/credential isolation. `atlas_commit_effect` catches and records the mismatches it is told about.
 * The issuer key sits unencrypted in `~/.atlas-mcp/issuer.json` (mode 0600). Protect the directory like an SSH key. Anyone who can read it can forge grants.
 * Local operator approval = local shell access. There is no remote approval channel in v0.1.
 * Not a compliance certification. Cryptographic choices follow the parent project's assumptions; no external audit has been done.

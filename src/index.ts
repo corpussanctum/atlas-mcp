@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
@@ -8,6 +8,7 @@ import { Engine } from "./engine.js";
 import { issueGrant, revokeGrant, type Scope } from "./grants.js";
 import { Issuer } from "./keys.js";
 import { serve } from "./server.js";
+import { isExempt, loadHookConfig, postHook, preHook, type HookConfig, type HookInput } from "./hook.js";
 import { VERSION } from "./version.js";
 
 const HELP = `atlas-mcp ${VERSION}: pre-action authorization for AI agents
@@ -21,6 +22,9 @@ const HELP = `atlas-mcp ${VERSION}: pre-action authorization for AI agents
                                     human decision on an escalated receipt
   atlas-mcp status <receipt_id>
   atlas-mcp verify                  verify the audit hash chain and signatures
+  atlas-mcp hook init [--principal P] [--env dev,staging]
+                                    set up the Claude Code hook (config + grant); prints settings.json
+  atlas-mcp hook pre|post           hook entry points (read the Claude Code event on stdin)
   atlas-mcp demo                    two-minute scripted demo (uses a throwaway data dir)
 
 Data dir: $ATLAS_MCP_DATA_DIR (default ~/.atlas-mcp)
@@ -40,7 +44,7 @@ async function main(): Promise<number> {
   const opts = {
     principal: { type: "string" }, subject: { type: "string" }, allow: { type: "string" }, deny: { type: "string" },
     escalate: { type: "string" }, env: { type: "string" }, resources: { type: "string" }, "ttl-hours": { type: "string" },
-    reason: { type: "string" }, by: { type: "string" }, note: { type: "string" },
+    reason: { type: "string" }, by: { type: "string" }, note: { type: "string" }, force: { type: "boolean" },
   } as const;
   const { values, positionals } = parseArgs({ args: rest, options: opts, allowPositionals: true });
 
@@ -75,6 +79,8 @@ async function main(): Promise<number> {
       console.log(JSON.stringify(r, null, 2));
       return r.valid ? 0 : 1;
     }
+    case "hook":
+      return hook(dataDir, positionals[0], values);
     case "demo":
       return demo();
     case "-h": case "--help": case "help":
@@ -84,6 +90,58 @@ async function main(): Promise<number> {
       console.error(HELP);
       return 2;
   }
+}
+
+/**
+ * Claude Code hook entry points. Exit 0 always; the decision travels in the JSON.
+ * A crash must never fail open for a gated tool, so `pre` answers deny on error.
+ */
+function hook(dataDir: string, sub: string | undefined, values: Record<string, string | boolean | undefined>): number {
+  if (sub === "init") return hookInit(dataDir, values);
+  if (sub !== "pre" && sub !== "post") throw new Error("usage: hook init|pre|post");
+
+  let input: HookInput = {};
+  try {
+    input = JSON.parse(readFileSync(0, "utf-8") || "{}") as HookInput;
+    const { engine } = open(dataDir);
+    if (sub === "pre") {
+      const out = preHook(input, engine, loadHookConfig(dataDir), dataDir);
+      if (out) console.log(JSON.stringify(out));
+    } else {
+      postHook(input, engine, dataDir);
+    }
+  } catch (err) {
+    const msg = `Atlas hook error: ${(err as Error).message}`;
+    console.error(msg);
+    if (sub === "pre" && !isExempt(input.tool_name ?? "")) {
+      console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: `${msg} (failing closed)` } }));
+    }
+  }
+  return 0;
+}
+
+function hookInit(dataDir: string, values: Record<string, string | boolean | undefined>): number {
+  const cfgPath = join(dataDir, "hook.json");
+  if (existsSync(cfgPath) && !values.force) throw new Error(`${cfgPath} exists; pass --force to replace it`);
+  const { issuer, log } = open(dataDir);
+  const principal = (values.principal as string | undefined) ?? `user:${process.env.USER ?? "operator"}`;
+  const agent = (values.subject as string | undefined) ?? "agent:claude-code";
+  const envs = list(values.env as string | undefined) ?? ["dev", "staging"];
+  const g = issueGrant(issuer, log, {
+    grantor: principal, subject: agent, ttlHours: Number(values["ttl-hours"] ?? 24 * 30),
+    scope: { allow: ["file.write", "shell.exec", "shell.deploy", "shell.delete", "network.fetch", "mcp.*"], escalate: ["shell.deploy", "shell.delete"], environments: envs },
+  });
+  const cfg: HookConfig = { agent, principal, delegation_chain: [g.id], default_environment: "dev" };
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+  console.log(`Wrote ${cfgPath} and grant ${g.id} (environments: ${envs.join(", ")}; deploy/delete ask first).\n`);
+  console.log("Add to ~/.claude/settings.json (or .claude/settings.json):\n");
+  console.log(JSON.stringify({
+    hooks: {
+      PreToolUse: [{ matcher: "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*", hooks: [{ type: "command", command: "atlas-mcp hook pre", timeout: 30 }] }],
+      PostToolUse: [{ matcher: "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*", hooks: [{ type: "command", command: "atlas-mcp hook post", timeout: 30 }] }],
+    },
+  }, null, 2));
+  return 0;
 }
 
 function demo(): number {
