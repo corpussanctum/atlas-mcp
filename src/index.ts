@@ -8,7 +8,7 @@ import { Engine } from "./engine.js";
 import { issueGrant, revokeGrant, type Scope } from "./grants.js";
 import { Issuer } from "./keys.js";
 import { serve } from "./server.js";
-import { isExempt, loadHookConfig, postHook, preHook, type HookConfig, type HookInput } from "./hook.js";
+import { isExempt, loadHookConfig, postHook, preHook, selfProtection, type HookConfig, type HookInput } from "./hook.js";
 import { VERSION } from "./version.js";
 
 const HELP = `atlas-mcp ${VERSION}: pre-action authorization for AI agents
@@ -113,7 +113,7 @@ function hook(dataDir: string, sub: string | undefined, values: Record<string, s
   } catch (err) {
     const msg = `Atlas hook error: ${(err as Error).message}`;
     console.error(msg);
-    if (sub === "pre" && !isExempt(input.tool_name ?? "")) {
+    if (sub === "pre" && (!isExempt(input.tool_name ?? "") || selfProtection(input, dataDir))) {
       console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: `${msg} (failing closed)` } }));
     }
   }
@@ -137,7 +137,7 @@ function hookInit(dataDir: string, values: Record<string, string | boolean | und
   console.log("Add to ~/.claude/settings.json (or .claude/settings.json):\n");
   console.log(JSON.stringify({
     hooks: {
-      PreToolUse: [{ matcher: "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*", hooks: [{ type: "command", command: "atlas-mcp hook pre", timeout: 30 }] }],
+      PreToolUse: [{ matcher: "Bash|Read|Grep|Glob|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*", hooks: [{ type: "command", command: "atlas-mcp hook pre", timeout: 30 }] }],
       PostToolUse: [{ matcher: "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*", hooks: [{ type: "command", command: "atlas-mcp hook post", timeout: 30 }] }],
     },
   }, null, 2));

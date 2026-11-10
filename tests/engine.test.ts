@@ -65,6 +65,22 @@ describe("authorize", () => {
     assert.equal(ask("db.read", [], [g.id]).decision, "permit");
   });
 
+  it("fails closed when no effects are declared under an environment- or resource-restricted grant", () => {
+    const env = grant("user:tj", "agent:a", { allow: ["db.*"], environments: ["staging"] });
+    const r = ask("db.delete", [], [env.id]);
+    assert.equal(r.decision, "deny");
+    assert.match(r.reason, /no effects were declared.*restricts environments/);
+    const res = grant("user:tj", "agent:a", { allow: ["db.*"], resources: ["db://staging/*"] });
+    assert.match(ask("db.delete", [], [res.id]).reason, /no effects were declared.*restricts resources/);
+    // The restriction may sit on any link of the chain.
+    const root = grant("user:tj", "agent:orch", { allow: ["db.*"], environments: ["staging"] });
+    const child = grant("agent:orch", "agent:worker", { allow: ["db.read"] });
+    assert.equal(ask("db.read", [], [root.id, child.id], "agent:worker").decision, "deny");
+    // An unrestricted grant still permits an action with no effects.
+    const open = grant("user:tj", "agent:a", { allow: ["db.*"] });
+    assert.equal(ask("db.read", [], [open.id]).decision, "permit");
+  });
+
   it("denies with an empty chain and for the wrong principal or agent", () => {
     const g = grant("user:tj", "agent:a", { allow: ["*"] });
     assert.equal(ask("db.read", [], []).decision, "deny");
@@ -170,8 +186,9 @@ describe("escalation, commit, receipts", () => {
 
   it("refuses to resolve a non-escalated receipt twice", () => {
     const g = setup();
-    const ok = ask("db.read", [], [g.id]);
-    assert.throws(() => engine.resolve(ok.receipt_id, "approve", "tj"), /not escalate/);
+    const ok = ask("db.read", [eff("read", "staging")], [g.id]);
+    assert.equal(ok.decision, "permit");
+    assert.throws(() => engine.resolve(ok.receipt_id, "approve", "tj"), /'permit', not escalate/);
     const e = ask("db.delete", [eff("delete", "staging")], [g.id]);
     engine.resolve(e.receipt_id, "approve", "tj");
     assert.throws(() => engine.resolve(e.receipt_id, "reject", "tj"), /already resolved/);

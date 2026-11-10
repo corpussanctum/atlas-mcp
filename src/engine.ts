@@ -76,6 +76,11 @@ export class Engine {
       if (!matchAny(s.allow, req.requested_action)) {
         return ["deny", `action '${req.requested_action}' is not delegated by grant ${g.id} (allows: ${s.allow.join(", ")})`, scope];
       }
+      // Fail closed: a restricted grant can only be checked against declared effects.
+      if (req.effects.length === 0 && (s.environments || s.resources)) {
+        const what = [s.environments && "environments", s.resources && "resources"].filter(Boolean).join(" and ");
+        return ["deny", `no effects were declared, but grant ${g.id} restricts ${what}; declare every effect so it can be checked`, scope];
+      }
       for (const e of req.effects) {
         if (s.environments) {
           if (!e.environment) return ["deny", `effect on '${e.resource}' has no environment, but grant ${g.id} restricts environments to ${s.environments.join(", ")}`, scope];
