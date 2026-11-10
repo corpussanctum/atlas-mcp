@@ -1,5 +1,5 @@
 import {
-  appendFileSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, statSync, truncateSync, unlinkSync, writeFileSync,
+  appendFileSync, closeSync, existsSync, fstatSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, statSync, truncateSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -134,12 +134,18 @@ export class AuditLog {
 
   /** Parse the log, reusing the previous parse while the file is unchanged. */
   private load(): Loaded {
-    let st;
-    try { st = statSync(this.path); } catch { return { entries: [], goodBytes: 0, torn: false }; }
-    const c = this.cache;
-    if (c && c.size === st.size && c.mtimeMs === st.mtimeMs && c.ino === st.ino) return c.loaded;
-
-    const raw = readFileSync(this.path);
+    // Stat and read through one descriptor, so the cache key describes the same file the bytes came from.
+    let fd: number;
+    try { fd = openSync(this.path, "r"); } catch { return { entries: [], goodBytes: 0, torn: false }; }
+    let st, raw: Buffer;
+    try {
+      st = fstatSync(fd);
+      const c = this.cache;
+      if (c && c.size === st.size && c.mtimeMs === st.mtimeMs && c.ino === st.ino) return c.loaded;
+      raw = readFileSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     const end = raw.lastIndexOf(0x0a) + 1; // bytes up to and including the last newline
     const loaded: Loaded = { entries: [], goodBytes: end, torn: end < raw.length };
     const lines = raw.subarray(0, end).toString("utf-8").split("\n");
@@ -171,9 +177,14 @@ export class AuditLog {
    * A missing head file is accepted: logs written before 0.1.2 have none.
    */
   private checkHead(entries: AuditEntry[]): string | undefined {
-    if (!existsSync(this.headPath)) return undefined;
+    let text: string;
+    try {
+      text = readFileSync(this.headPath, "utf-8");
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "ENOENT" ? undefined : "audit.head is unreadable";
+    }
     let head: Head;
-    try { head = JSON.parse(readFileSync(this.headPath, "utf-8")) as Head; } catch { return "audit.head is unreadable"; }
+    try { head = JSON.parse(text) as Head; } catch { return "audit.head is unreadable"; }
     if (!head || !Number.isInteger(head.seq) || typeof head.hash !== "string" || typeof head.signature !== "string"
       || !this.issuer.verify(canonical({ seq: head.seq, hash: head.hash }), head.signature)) {
       return "audit.head has an invalid signature";
