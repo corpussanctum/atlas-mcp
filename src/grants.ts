@@ -70,7 +70,9 @@ export function revokedIds(log: AuditLog): Set<string> {
   return new Set(log.read().filter((e) => e.type === "REVOKE").map((e) => e.data.grant_id as string));
 }
 
-export type ChainResult = { ok: true; chain: Grant[] } | { ok: false; reason: string };
+export type ChainResult =
+  | { ok: true; chain: Grant[] }
+  | { ok: false; reason: string; /** Why a once-valid chain stopped being valid, when that is the cause. */ code?: "revoked" | "expired" };
 
 /**
  * Resolve and verify a delegation chain (root first). Each entry is a grant id
@@ -98,8 +100,8 @@ export function verifyChain(
     if (!g) return { ok: false, reason: `unknown grant ${JSON.stringify(id)}` };
     const { issuer_key_id, signature, ...body } = g;
     if (issuer_key_id !== issuer.keyId || !issuer.verify(canonical(body), signature)) return { ok: false, reason: `grant ${g.id} has an invalid signature` };
-    if (revoked.has(g.id)) return { ok: false, reason: `grant ${g.id} was revoked` };
-    if (now > new Date(g.expires_at)) return { ok: false, reason: `grant ${g.id} expired at ${g.expires_at}` };
+    if (revoked.has(g.id)) return { ok: false, reason: `grant ${g.id} was revoked`, code: "revoked" };
+    if (now > new Date(g.expires_at)) return { ok: false, reason: `grant ${g.id} expired at ${g.expires_at}`, code: "expired" };
     chain.push(g);
   }
 

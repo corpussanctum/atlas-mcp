@@ -139,6 +139,8 @@ function hookInit(dataDir: string, values: Record<string, string | boolean | und
     hooks: {
       PreToolUse: [{ matcher: "Bash|Read|Grep|Glob|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*", hooks: [{ type: "command", command: "atlas-mcp hook pre", timeout: 30 }] }],
       PostToolUse: [{ matcher: "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*", hooks: [{ type: "command", command: "atlas-mcp hook post", timeout: 30 }] }],
+      // Claude Code reports failed tool calls through a separate event; without it they would never be committed.
+      PostToolUseFailure: [{ matcher: "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*", hooks: [{ type: "command", command: "atlas-mcp hook post", timeout: 30 }] }],
     },
   }, null, 2));
   return 0;

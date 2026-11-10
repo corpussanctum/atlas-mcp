@@ -1,15 +1,15 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AuditLog } from "../src/audit.js";
 import { Engine } from "../src/engine.js";
-import { issueGrant } from "../src/grants.js";
+import { issueGrant, revokeGrant } from "../src/grants.js";
 import { Issuer } from "../src/keys.js";
-import { classify, isExempt, postHook, preHook, type HookConfig } from "../src/hook.js";
+import { classify, isExempt, PENDING_MAX_AGE_MS, postHook, preHook, sweepPending, type HookConfig } from "../src/hook.js";
 
 let dir: string;
 let engine: Engine;
@@ -154,6 +154,30 @@ describe("postHook", () => {
     postHook({ tool_name: "Bash", tool_use_id: "t3", hook_event_name: "PostToolUseFailure" }, engine, dir);
     assert.equal(engine.log.read().at(-1)?.data.outcome, "failure");
   });
+  it("still records a call whose grant was revoked while it ran, as a violation", () => {
+    pre(bash("npm test", "t4"));
+    revokeGrant(engine.log, cfg.delegation_chain[0], "pulled mid-run");
+    assert.ok(postHook({ tool_name: "Bash", tool_use_id: "t4" }, engine, dir));
+    const last = engine.log.read().at(-1)!;
+    assert.equal(last.type, "COMMIT");
+    assert.equal(last.data.receipt_state, "revoked");
+    assert.deepEqual(readdirSync(join(dir, "hook-pending")), []);
+  });
+  it("leaves no pending marker for a denied call, and sweeps markers that were never collected", () => {
+    assert.equal(pre(bash("psql production", "t5"))?.hookSpecificOutput.permissionDecision, "deny");
+    assert.equal(existsSync(join(dir, "hook-pending", "t5.json")), false);
+
+    const pending = join(dir, "hook-pending");
+    pre(bash("rm -rf dist", "declined")); // escalated; suppose the user declines the prompt
+    const old = new Date(Date.now() - PENDING_MAX_AGE_MS - 60_000);
+    utimesSync(join(pending, "declined.json"), old, old);
+    pre(bash("npm test", "fresh"));
+    assert.deepEqual(readdirSync(pending), ["fresh.json"]);
+
+    writeFileSync(join(pending, "x.json"), "{}");
+    sweepPending(pending, Date.now() + PENDING_MAX_AGE_MS + 60_000);
+    assert.deepEqual(readdirSync(pending), []);
+  });
   it("ignores calls Atlas never saw", () => {
     assert.equal(postHook({ tool_name: "Bash", tool_use_id: "unknown" }, engine, dir), null);
   });
@@ -181,6 +205,9 @@ describe("CLI hook", () => {
   it("init writes a config, then pre denies production end to end", () => {
     const out = execFileSync(process.execPath, [BIN, "hook", "init", "--principal", "user:alice"], { env: env(), encoding: "utf-8" });
     assert.match(out, /"PreToolUse"/);
+    const settings = JSON.parse(out.slice(out.indexOf("{")));
+    assert.equal(settings.hooks.PostToolUseFailure[0].hooks[0].command, "atlas-mcp hook post");
+    assert.equal(settings.hooks.PostToolUseFailure[0].matcher, settings.hooks.PostToolUse[0].matcher);
     assert.match(out, /"matcher": "Bash\|Read\|Grep\|Glob\|/);
     assert.equal(JSON.parse(run("pre", { tool_name: "Read", tool_input: { file_path: join(dir, "issuer.json") } }).stdout).hookSpecificOutput.permissionDecision, "deny");
     assert.ok(existsSync(join(dir, "hook.json")));

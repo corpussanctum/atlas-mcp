@@ -64,14 +64,14 @@ npx -y @corpussanctum/atlas-mcp verify            # check the audit chain and si
 |---|---|
 | `atlas_authorize` | `{agent, principal, requested_action, effects[], delegation_chain[]}` → `{decision, reason, scope, receipt_id}` |
 | `atlas_commit_effect` | Report what actually happened under a receipt. One commit per receipt. Effects the receipt never covered are flagged as `violation`. |
-| `atlas_receipt_status` | `ready`, `pending_approval`, `rejected`, `denied`, `committed`, `expired` |
-| `atlas_verify_audit` | Verify the SHA3-256 chain and every ML-DSA-65 signature |
+| `atlas_receipt_status` | `ready`, `pending_approval`, `rejected`, `denied`, `committed`, `expired`, `revoked` |
+| `atlas_verify_audit` | Verify the SHA3-256 chain, every ML-DSA-65 signature, and that the log still reaches its signed head |
 
 ## How decisions work
 
 * A **grant** says: grantor → subject may do `allow` actions (minus `deny`), only in `environments`, only on `resources`, with `escalate` actions needing a human. Grants are signed by the local issuer key and recorded in the audit log.
 * A **chain** runs principal → agent → sub-agent. It must be unbroken, unexpired, unrevoked, and **may only narrow** from link to link. A child grant that widens its parent is rejected.
-* **Intersection semantics:** every link must independently allow the action and each effect. Revoking any link kills everything below it.
+* **Intersection semantics:** every link must independently allow the action and each effect. Revoking any link kills everything below it, including receipts already issued but not yet committed (they become `revoked`).
 * **Fail closed:** unknown grants, bad signatures, missing environments under an environment-restricted grant, a request with no effects under an environment- or resource-restricted grant, and malformed requests all deny. The server trusts its own recorded copy of a grant, never the caller's.
 * Receipts expire after 15 minutes. A permit/approval covers the stated effects only.
 
@@ -99,7 +99,7 @@ atlas-mcp hook init --principal user:alice
 | `Read`, `Grep`, `Glob`, Atlas's own tools | not gated, except below | |
 | anything reaching `~/.atlas-mcp`; `atlas-mcp grant`, `revoke`, `resolve`, `hook init` | | **deny**: agents cannot read or change their own authority |
 
-The `PostToolUse` hook then commits the receipt (success or failure) to the signed audit log. Check it any time with `atlas-mcp verify`.
+The `PostToolUse` and `PostToolUseFailure` hooks then commit the receipt (success or failure) to the signed audit log, even when the command outlived the receipt's 15 minutes; a call whose grant was revoked while it ran is recorded as a violation. Check it any time with `atlas-mcp verify`. If you set the hook up before `PostToolUseFailure` was part of the printed block, add it, or failed calls go unrecorded.
 
 ### Tuning
 
@@ -132,12 +132,13 @@ Edit `~/.atlas-mcp/hook.json`:
 
 * **This is a gate the agent consults, not a sandbox.** On its own, an MCP tool cannot stop an agent that decides not to call it, or that lies about its effects. v0.1 gives you a signed, verifiable record and a decision to enforce *with*: for Claude Code, use the hook above to make it binding; elsewhere pair it with a tool proxy or network/credential isolation. `atlas_commit_effect` catches and records the mismatches it is told about.
 * The issuer key sits unencrypted in `~/.atlas-mcp/issuer.json` (mode 0600). Protect the directory like an SSH key. Anyone who can read it can forge grants.
+* **The audit log detects edits, removals and reordering; truncation only partly.** A signed head (`audit.head`) records the newest entry, so `verify` notices entries cut from the end, and Atlas refuses to authorize on top of a shortened log. Someone who deletes the head file as well leaves a shorter log that still verifies (with a warning). For stronger evidence, copy `audit.head` somewhere the agent's account cannot write.
 * Local operator approval = local shell access. There is no remote approval channel in v0.1.
 * Not a compliance certification. Cryptographic choices follow the parent project's assumptions; no external audit has been done.
 
 ## Data and config
 
-`ATLAS_MCP_DATA_DIR` (default `~/.atlas-mcp`) holds `issuer.json` and `audit.jsonl`. Nothing leaves the machine.
+`ATLAS_MCP_DATA_DIR` (default `~/.atlas-mcp`) holds `issuer.json`, `audit.jsonl` and its signed head `audit.head`. Nothing leaves the machine.
 
 ## Docker
 

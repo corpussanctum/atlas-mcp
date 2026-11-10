@@ -1,8 +1,10 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdtempSync, readdirSync, rmSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { AuditLog } from "../src/audit.js";
 import { Engine, type Effect } from "../src/engine.js";
 import { issueGrant, revokeGrant, type Scope } from "../src/grants.js";
@@ -184,6 +186,63 @@ describe("escalation, commit, receipts", () => {
     assert.equal(c.violations.length, 1);
   });
 
+  it("invalidates outstanding receipts when a grant behind them is revoked", () => {
+    const g = setup();
+    const ready = ask("db.read", [eff("read", "staging")], [g.id]);
+    const waiting = ask("db.delete", [eff("delete", "staging")], [g.id]);
+    const done = ask("db.read", [eff("read", "staging")], [g.id]);
+    engine.commit({ receipt_id: done.receipt_id, outcome: "success" });
+    assert.equal(engine.status(ready.receipt_id).state, "ready");
+
+    revokeGrant(log, g.id, "compromised");
+    const st = engine.status(ready.receipt_id);
+    assert.equal(st.state, "revoked");
+    assert.match(st.invalid_reason as string, /was revoked/);
+    assert.throws(() => engine.commit({ receipt_id: ready.receipt_id, outcome: "success" }), /state is 'revoked'/);
+    // An approval given after the revocation does not bring the receipt back.
+    assert.equal(engine.status(waiting.receipt_id).state, "revoked");
+    engine.resolve(waiting.receipt_id, "approve", "tj");
+    assert.equal(engine.status(waiting.receipt_id).state, "revoked");
+    // What was already committed stays committed.
+    assert.equal(engine.status(done.receipt_id).state, "committed");
+  });
+
+  it("invalidates a receipt when a parent link is revoked or the grant expires", () => {
+    const root = grant("user:tj", "agent:orch", { allow: ["db.*"] });
+    const child = grant("agent:orch", "agent:worker", { allow: ["db.read"] });
+    const r = ask("db.read", [], [root.id, child.id], "agent:worker");
+    revokeGrant(log, root.id, "x");
+    assert.equal(engine.status(r.receipt_id).state, "revoked");
+
+    const short = grant("user:tj", "agent:a", { allow: ["db.*"] }, 0.1); // six minutes, inside the receipt's fifteen
+    const r2 = ask("db.read", [], [short.id]);
+    const st = engine.status(r2.receipt_id, new Date(Date.now() + 10 * 60_000));
+    assert.equal(st.state, "expired");
+    assert.match(st.invalid_reason as string, /expired at/);
+  });
+
+  it("records a late commit for an action that already ran, and flags revoked authority", () => {
+    const g = grant("user:tj", "agent:a", { allow: ["db.*"] });
+    const later = new Date(Date.now() + 20 * 60_000);
+    const slow = ask("db.read", [eff("read", "staging")], [g.id]);
+    assert.throws(() => engine.commit({ receipt_id: slow.receipt_id, outcome: "success" }, later), /expired/);
+    const c = engine.commit({ receipt_id: slow.receipt_id, outcome: "success", effects: [eff("read", "staging")], late: true }, later);
+    assert.equal(c.status, "recorded");
+    assert.equal(c.receipt_state, "expired");
+    assert.equal(log.read().at(-1)?.data.receipt_state, "expired");
+    assert.throws(() => engine.commit({ receipt_id: slow.receipt_id, outcome: "success", late: true }, later), /committed/);
+
+    const pulled = ask("db.read", [eff("read", "staging")], [g.id]);
+    revokeGrant(log, g.id, "x");
+    const v = engine.commit({ receipt_id: pulled.receipt_id, outcome: "success", effects: [eff("read", "staging")], late: true });
+    assert.equal(v.status, "violation");
+    assert.equal(v.receipt_state, "revoked");
+
+    // late never rescues a receipt that was not usable in the first place.
+    const denied = ask("net.fetch", [], [g.id]);
+    assert.throws(() => engine.commit({ receipt_id: denied.receipt_id, outcome: "success", late: true }), /denied/);
+  });
+
   it("refuses to resolve a non-escalated receipt twice", () => {
     const g = setup();
     const ok = ask("db.read", [eff("read", "staging")], [g.id]);
@@ -216,5 +275,137 @@ describe("audit log", () => {
     e.signature = JSON.parse(lines[1]).signature;
     writeFileSync(log.path, [lines[0], lines[1], JSON.stringify(e)].join("\n") + "\n");
     assert.equal(log.verify().valid, false);
+  });
+});
+
+describe("audit log: truncation, interrupted writes, corruption", () => {
+  const lines = () => readFileSync(log.path, "utf-8").trimEnd().split("\n");
+  const seed = () => {
+    const g = grant("user:tj", "agent:a", { allow: ["*"] });
+    ask("x", [], [g.id]);
+    return g;
+  };
+
+  it("detects entries removed from the end, and refuses to build on the shortened log", () => {
+    const g = seed();
+    revokeGrant(log, g.id, "compromised");
+    assert.deepEqual(log.verify(), { valid: true, entries: 3 });
+
+    writeFileSync(log.path, lines().slice(0, -1).join("\n") + "\n"); // drop the REVOKE
+    const v = log.verify();
+    assert.equal(v.valid, false);
+    assert.equal(v.broken_at, 3);
+    assert.match(v.reason!, /truncated: the signed head is entry 3, but the log holds 2/);
+    // The revoked grant must not come back to life: authorize fails closed instead of permitting.
+    assert.throws(() => ask("x", [], [g.id]), /integrity check.*truncated/);
+    assert.equal(lines().length, 2, "nothing was appended on top of the damage");
+  });
+
+  it("detects a rewritten log and a forged head", () => {
+    seed();
+    const head = readFileSync(log.headPath, "utf-8");
+    const forged = JSON.parse(head);
+    forged.seq = 1;
+    writeFileSync(log.headPath, JSON.stringify(forged));
+    assert.match(log.verify().reason!, /audit.head has an invalid signature/);
+    writeFileSync(log.headPath, "not json");
+    assert.match(log.verify().reason!, /unreadable/);
+    writeFileSync(log.headPath, head);
+    assert.equal(log.verify().valid, true);
+  });
+
+  it("accepts a log that runs ahead of its head (crash between the two writes)", () => {
+    const g = seed();
+    const earlier = readFileSync(log.headPath, "utf-8");
+    ask("y", [], [g.id]);
+    writeFileSync(log.headPath, earlier);
+    assert.deepEqual(log.verify(), { valid: true, entries: 3 });
+    assert.equal(ask("z", [], [g.id]).decision, "permit");
+    assert.deepEqual(log.verify(), { valid: true, entries: 4 });
+  });
+
+  it("warns about a log with no head (written before the head existed), then adopts one", () => {
+    const g = seed();
+    unlinkSync(log.headPath);
+    const v = log.verify();
+    assert.equal(v.valid, true);
+    assert.match(v.warning!, /no signed head/);
+    ask("y", [], [g.id]);
+    assert.ok(existsSync(log.headPath));
+    assert.deepEqual(log.verify(), { valid: true, entries: 3 });
+  });
+
+  it("survives an interrupted final write and repairs it on the next append", () => {
+    const g = seed();
+    appendFileSync(log.path, '{"seq":3,"ts":"2026');
+    const v = log.verify();
+    assert.equal(v.valid, true);
+    assert.equal(v.entries, 2);
+    assert.match(v.warning!, /incomplete line/);
+    assert.equal(ask("y", [], [g.id]).decision, "permit");
+    assert.deepEqual(log.verify(), { valid: true, entries: 3 });
+    assert.equal(lines().length, 3);
+  });
+
+  it("reports an unreadable line instead of crashing, and fails closed", () => {
+    const g = seed();
+    const [first, second] = lines();
+    for (const junk of ["{ not json", "null", '{"seq":2}']) {
+      writeFileSync(log.path, [first, junk, second].join("\n") + "\n");
+      const v = log.verify();
+      assert.equal(v.valid, false, junk);
+      assert.equal(v.broken_at, 2, junk);
+      assert.match(v.reason!, /line 2 is not a valid audit entry/, junk);
+      assert.throws(() => ask("y", [], [g.id]), /corrupt at line 2/, junk);
+    }
+  });
+
+  it("sees entries appended by another process without re-reading an unchanged file", () => {
+    const g = seed();
+    const before = log.read();
+    assert.equal(log.read(), before, "an unchanged file is not parsed again");
+    const other = new AuditLog(dir, issuer);
+    other.append("REVOKE", { grant_id: g.id, reason: "from elsewhere" });
+    assert.equal(log.read().length, 3);
+    assert.match(ask("x", [], [g.id]).reason, /revoked/);
+    assert.deepEqual(log.verify(), { valid: true, entries: 4 });
+  });
+});
+
+describe("audit log: locking and first run", () => {
+  const BIN = resolve(dirname(fileURLToPath(import.meta.url)), "..", "src", "index.js");
+  const lock = () => join(dir, "audit.lock");
+
+  it("takes over at once from a holder that died, and after a timeout from one it cannot check", () => {
+    const g = grant("user:tj", "agent:a", { allow: ["*"] });
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+    writeFileSync(lock(), `${hostname()}:${deadPid}:abc`);
+    let t = Date.now();
+    assert.equal(ask("x", [], [g.id]).decision, "permit");
+    assert.ok(Date.now() - t < 2000, "did not wait out the stale timeout");
+
+    writeFileSync(lock(), "some-other-host:1:abc");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lock(), old, old);
+    t = Date.now();
+    assert.equal(ask("y", [], [g.id]).decision, "permit");
+    assert.ok(Date.now() - t < 2000);
+    assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith("audit.lock")), [], "no lock files left behind");
+    assert.deepEqual(log.verify(), { valid: true, entries: 3 });
+  });
+
+  it("keeps one key and one unbroken chain when several first runs race", async () => {
+    const fresh = mkdtempSync(join(tmpdir(), "atlas-mcp-race-"));
+    try {
+      const run = (i: number) => new Promise<number | null>((done) => {
+        const p = spawn(process.execPath, [BIN, "grant", "--principal", "user:tj", "--subject", `agent:${i}`, "--allow", "x"], { env: { ...process.env, ATLAS_MCP_DATA_DIR: fresh }, stdio: "ignore" });
+        p.on("exit", done);
+      });
+      const codes = await Promise.all(Array.from({ length: 8 }, (_, i) => run(i)));
+      assert.deepEqual(codes, Array(8).fill(0));
+      const check = new AuditLog(fresh, Issuer.loadOrCreate(fresh));
+      assert.deepEqual(check.verify(), { valid: true, entries: 8 });
+      assert.deepEqual(readdirSync(fresh).sort(), ["audit.head", "audit.jsonl", "issuer.json"]);
+    } finally { rmSync(fresh, { recursive: true, force: true }); }
   });
 });

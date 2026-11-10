@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Engine, type Effect } from "./engine.js";
 
@@ -166,7 +166,8 @@ export function preHook(input: HookInput, engine: Engine, cfg: HookConfig, dataD
   if (!call) return null;
 
   const r = engine.authorize({ agent: cfg.agent, principal: cfg.principal, requested_action: call.action, effects: call.effects, delegation_chain: cfg.delegation_chain });
-  if (input.tool_use_id) savePending(dataDir, input.tool_use_id, r.receipt_id);
+  // A denied call never runs, so nothing will come back to collect a marker for it.
+  if (input.tool_use_id && r.decision !== "deny") savePending(dataDir, input.tool_use_id, r.receipt_id);
 
   const tag = `Atlas ${r.decision} [${r.receipt_id}]: ${r.reason}`;
   if (r.decision === "deny") return deny(tag);
@@ -189,7 +190,8 @@ export function postHook(input: HookInput, engine: Engine, dataDir: string): str
   if (st.state === "pending_approval") engine.resolve(receipt, "approve", "claude-code-prompt", `tool ${input.tool_name} ran after the user accepted the permission prompt`);
   const failed = input.hook_event_name === "PostToolUseFailure" || isErrorResponse(input.tool_response);
   const authorized = (engine.log.read().find((e) => e.type === "AUTHORIZE" && `rcpt_${e.hash.slice(0, 16)}` === receipt)?.data.effects ?? []) as Effect[];
-  engine.commit({ receipt_id: receipt, outcome: failed ? "failure" : "success", effects: authorized, note: "recorded by PostToolUse hook; effects as classified, not independently observed" });
+  // late: the tool has already run, so record it even if the receipt expired or its grant was revoked meanwhile.
+  engine.commit({ receipt_id: receipt, outcome: failed ? "failure" : "success", effects: authorized, late: true, note: "recorded by PostToolUse hook; effects as classified, not independently observed" });
   return receipt;
 }
 
@@ -203,8 +205,21 @@ function pendingPath(dataDir: string, id: string): string {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   return join(dir, `${safeId(id)}.json`);
 }
+/** Markers older than this belong to calls that never reported back (a prompt the user declined, a killed session). */
+export const PENDING_MAX_AGE_MS = 24 * 3_600_000;
+
 function savePending(dataDir: string, id: string, receipt: string): void {
-  writeFileSync(pendingPath(dataDir, id), JSON.stringify({ receipt_id: receipt }), { mode: 0o600 });
+  const path = pendingPath(dataDir, id);
+  writeFileSync(path, JSON.stringify({ receipt_id: receipt }), { mode: 0o600 });
+  sweepPending(join(dataDir, "hook-pending"));
+}
+export function sweepPending(dir: string, now = Date.now()): void {
+  try {
+    for (const f of readdirSync(dir)) {
+      const p = join(dir, f);
+      try { if (now - statSync(p).mtimeMs > PENDING_MAX_AGE_MS) unlinkSync(p); } catch { /* raced with another hook */ }
+    }
+  } catch { /* nothing to sweep */ }
 }
 function takePending(dataDir: string, id: string): string | undefined {
   const p = pendingPath(dataDir, id);

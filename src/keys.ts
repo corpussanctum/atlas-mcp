@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa";
@@ -16,23 +16,34 @@ export class Issuer {
 
   static loadOrCreate(dataDir: string): Issuer {
     const path = join(dataDir, "issuer.json");
-    if (existsSync(path)) {
+    const load = () => {
       const j = JSON.parse(readFileSync(path, "utf-8"));
       return new Issuer(Buffer.from(j.public_key_b64, "base64"), Buffer.from(j.secret_key_b64, "base64"));
-    }
+    };
+    if (existsSync(path)) return load();
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const kp = ml_dsa65.keygen(randomBytes(32));
+    // Write the whole file under a private name, then link it into place. The link fails if another
+    // process got there first, so two first runs never end up with different keys or a half-written file.
+    const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
     writeFileSync(
-      path,
+      tmp,
       JSON.stringify({
         algorithm: "ML-DSA-65",
         public_key_b64: Buffer.from(kp.publicKey).toString("base64"),
         secret_key_b64: Buffer.from(kp.secretKey).toString("base64"),
         created_at: new Date().toISOString(),
       }),
-      { mode: 0o600 },
+      { mode: 0o600, flag: "wx" },
     );
-    chmodSync(path, 0o600);
+    try {
+      linkSync(tmp, path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      return load();
+    } finally {
+      unlinkSync(tmp);
+    }
     return new Issuer(kp.publicKey, kp.secretKey);
   }
 
