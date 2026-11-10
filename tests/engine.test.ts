@@ -375,12 +375,14 @@ describe("audit log: truncation, interrupted writes, corruption", () => {
     utimesSync(log.path, stamp, stamp);
     assert.equal(log.verify().valid, true);
     assert.equal(log.read().length, 2); // the parse is now remembered
-    const before = statSync(log.path);
     const text = readFileSync(log.path, "utf-8");
-    writeFileSync(log.path, text.replace('"requested_action":"x"', '"requested_action":"z"'));
+    const edited = text.replace('"requested_action":"x"', '"requested_action":"z"');
+    assert.notEqual(edited, text);
+    writeFileSync(log.path, edited);
     utimesSync(log.path, stamp, stamp);
+    // Same size and modification time as the file the parse was remembered from.
     const after = statSync(log.path);
-    assert.deepEqual([after.size, after.mtimeMs], [before.size, before.mtimeMs]);
+    assert.deepEqual([after.size, Math.round(after.mtimeMs)], [Buffer.byteLength(text), stamp.getTime()]);
     const v = log.verify();
     assert.equal(v.valid, false);
     assert.match(v.reason!, /hash mismatch/);
