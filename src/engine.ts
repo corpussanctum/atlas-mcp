@@ -76,6 +76,11 @@ export class Engine {
       if (!matchAny(s.allow, req.requested_action)) {
         return ["deny", `action '${req.requested_action}' is not delegated by grant ${g.id} (allows: ${s.allow.join(", ")})`, scope];
       }
+      // Fail closed: a restricted grant can only be checked against declared effects.
+      if (req.effects.length === 0 && (s.environments || s.resources)) {
+        const what = [s.environments && "environments", s.resources && "resources"].filter(Boolean).join(" and ");
+        return ["deny", `no effects were declared, but grant ${g.id} restricts ${what}; declare every effect so it can be checked`, scope];
+      }
       for (const e of req.effects) {
         if (s.environments) {
           if (!e.environment) return ["deny", `effect on '${e.resource}' has no environment, but grant ${g.id} restricts environments to ${s.environments.join(", ")}`, scope];
@@ -110,21 +115,37 @@ export class Engine {
     const res = this.findResolve(receipt);
     const commit = this.findCommit(receipt);
     let state: string;
+    let invalid_reason: string | undefined;
     if (d.decision === "deny") state = "denied";
     else if (commit) state = "committed";
-    else if (d.decision === "escalate" && !res) state = "pending_approval";
     else if (res?.data.outcome === "reject") state = "rejected";
-    else if (now > new Date(d.expires_at as string)) state = "expired";
-    else state = "ready";
-    return { found: true, state, decision: d.decision, reason: d.reason, scope: d.scope, expires_at: d.expires_at, resolution: res?.data };
+    else {
+      // A receipt is only as good as the authority behind it: re-check the chain as it stands now.
+      const chain = verifyChain(this.issuer, this.log, d.principal as string, d.agent as string, d.chain as string[], now);
+      if (!chain.ok) {
+        state = chain.code === "expired" ? "expired" : "revoked";
+        invalid_reason = chain.reason;
+      } else if (d.decision === "escalate" && !res) state = "pending_approval";
+      else if (now > new Date(d.expires_at as string)) state = "expired";
+      else state = "ready";
+    }
+    return { found: true, state, decision: d.decision, reason: d.reason, scope: d.scope, expires_at: d.expires_at, resolution: res?.data, ...(invalid_reason ? { invalid_reason } : {}) };
   }
 
-  /** Report what was actually done under a receipt; flags effects the receipt never covered. */
-  commit(p: { receipt_id: string; outcome: "success" | "failure"; effects?: Effect[]; note?: string }, now = new Date()) {
+  /**
+   * Report what was actually done under a receipt; flags effects the receipt never covered.
+   *
+   * `late` is for an enforcement point (the hook) reporting an action that has
+   * already run: the record must not be lost because the receipt expired or its
+   * grant was revoked while the action was running. The state is recorded, and
+   * a commit under revoked authority counts as a violation.
+   */
+  commit(p: { receipt_id: string; outcome: "success" | "failure"; effects?: Effect[]; note?: string; late?: boolean }, now = new Date()) {
     const auth = this.findAuthorize(p.receipt_id);
     if (!auth) throw new Error(`unknown receipt ${p.receipt_id}`);
     const st = this.status(p.receipt_id, now).state as string;
-    if (st !== "ready") throw new Error(`receipt ${p.receipt_id} cannot be committed: state is '${st}'`);
+    const lateOk = p.late && (st === "expired" || st === "revoked");
+    if (st !== "ready" && !lateOk) throw new Error(`receipt ${p.receipt_id} cannot be committed: state is '${st}'`);
 
     const authorized = auth.data.effects as Effect[];
     const observed = p.effects ?? [];
@@ -135,12 +156,14 @@ export class Engine {
       observed_effects: observed,
       violations,
       note: p.note,
+      ...(st !== "ready" ? { receipt_state: st } : {}),
     });
     return {
       commit_id: `cmt_${entry.hash.slice(0, 16)}`,
-      status: violations.length ? "violation" : "recorded",
+      status: violations.length || st === "revoked" ? "violation" : "recorded",
       violations,
       audit_seq: entry.seq,
+      ...(st !== "ready" ? { receipt_state: st } : {}),
     };
   }
 

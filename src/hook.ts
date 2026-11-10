@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Engine, type Effect } from "./engine.js";
 
@@ -53,8 +53,9 @@ export interface HookOutput {
 }
 
 export const DEFAULT_ENVIRONMENTS = [
-  { match: "\\b(prod|production|prd)\\b", environment: "production" },
-  { match: "\\b(stage|staging|stg)\\b", environment: "staging" },
+  // Letter boundaries, not \b: `_` and digits are word characters, so \b misses PROD_DB_URL, db_prod, prod1.
+  { match: "(?<![a-z])(prod|production|prd)(?![a-z])", environment: "production" },
+  { match: "(?<![a-z])(stage|staging|stg)(?![a-z])", environment: "staging" },
 ];
 
 const BUILTIN: HookRule[] = [
@@ -65,9 +66,52 @@ const BUILTIN: HookRule[] = [
   { tool: "^(WebFetch|WebSearch)$", action: "network.fetch", effect_type: "read" },
 ];
 
-/** Tools Atlas does not gate: reads, planning, and Atlas's own MCP tools. */
+/**
+ * Tools Atlas does not gate: reads, planning, and Atlas's own MCP tools. The
+ * server and tool names are matched exactly: a prefix test would also exempt
+ * unrelated servers such as `mcp__atlassian__*`.
+ */
 export function isExempt(tool: string): boolean {
-  return /^(Read|Glob|Grep|LS|TodoWrite|ExitPlanMode|Task|BashOutput|KillShell)$/.test(tool) || /^mcp__atlas/.test(tool);
+  return /^(Read|Glob|Grep|LS|TodoWrite|ExitPlanMode|Task|BashOutput|KillShell)$/.test(tool)
+    || /^mcp__atlas(-mcp)?__atlas_(authorize|commit_effect|receipt_status|verify_audit)$/.test(tool);
+}
+
+/** The Atlas CLI subcommands that change authority; only the human operator may run them. */
+const AUTHORITY_CLI = /atlas-mcp(?:@[\w.-]+)?["']?\s+(grant|revoke|resolve|hook\s+init)\b/i;
+
+/** Inputs that hold a filesystem path, per tool. Other inputs (file content, search regexes) are not paths. */
+const PATH_FIELDS: Record<string, string[]> = {
+  Read: ["file_path"], Write: ["file_path"], Edit: ["file_path"], MultiEdit: ["file_path"], NotebookEdit: ["notebook_path"],
+  Glob: ["path", "pattern"], Grep: ["path", "glob"], LS: ["path"],
+};
+
+function strings(v: unknown, out: string[] = []): string[] {
+  if (typeof v === "string") out.push(v);
+  else if (Array.isArray(v)) for (const x of v) strings(x, out);
+  else if (v && typeof v === "object") for (const x of Object.values(v)) strings(x, out);
+  return out;
+}
+
+/**
+ * Why a tool call would touch Atlas's own authority, or undefined. Runs for
+ * every tool, exempt or not: reading the issuer key is as bad as editing a
+ * grant. Tools with known path inputs are checked on those; a shell command is
+ * checked whole; anything else (MCP tools) on every string it is given.
+ */
+export function selfProtection(input: HookInput, dataDir: string): string | undefined {
+  const tool = input.tool_name ?? "";
+  const args = input.tool_input ?? {};
+  const protectedDir = resolve(dataDir);
+  const fields = PATH_FIELDS[tool];
+  const values = fields ? fields.map((k) => args[k]).filter((v): v is string => typeof v === "string") : strings(args);
+  const candidates = fields ? values.flatMap((v) => [v, resolve(input.cwd ?? process.cwd(), v)]) : values;
+  if (candidates.some((v) => v.includes(protectedDir) || /\.atlas-mcp\b/.test(v))) {
+    return `'${tool}' touches Atlas's own data directory; agents cannot read or change their own authority.`;
+  }
+  const command = tool === "Bash" && typeof args.command === "string" ? args.command : "";
+  const cli = AUTHORITY_CLI.exec(command);
+  if (cli) return `'atlas-mcp ${cli[1].replace(/\s+/g, " ")}' changes delegated authority; only the human operator may run it, in their own shell.`;
+  return undefined;
 }
 
 function resourceOf(tool: string, input: Record<string, unknown> = {}): string {
@@ -113,19 +157,17 @@ const deny = (reason: string): HookOutput => ({ hookSpecificOutput: { hookEventN
 
 /** Returns null to defer to Claude Code's normal permission flow. */
 export function preHook(input: HookInput, engine: Engine, cfg: HookConfig, dataDir: string): HookOutput | null {
+  // The agent must not read or edit its own authority. Checked before classification so it also covers exempt tools.
+  const self = selfProtection(input, dataDir);
+  if (self) return deny(`Atlas: ${self}`);
+
   const tool = input.tool_name ?? "";
   const call = classify(cfg, tool, input.tool_input);
   if (!call) return null;
 
-  // The agent must not edit its own authority.
-  const protectedDir = resolve(dataDir);
-  const resource = call.effects[0].resource;
-  if (resource.includes(protectedDir) || /\.atlas-mcp\b/.test(resource)) {
-    return deny(`Atlas: '${tool}' touches Atlas's own data directory; agents cannot change their own authority.`);
-  }
-
   const r = engine.authorize({ agent: cfg.agent, principal: cfg.principal, requested_action: call.action, effects: call.effects, delegation_chain: cfg.delegation_chain });
-  if (input.tool_use_id) savePending(dataDir, input.tool_use_id, r.receipt_id);
+  // A denied call never runs, so nothing will come back to collect a marker for it.
+  if (input.tool_use_id && r.decision !== "deny") savePending(dataDir, input.tool_use_id, r.receipt_id);
 
   const tag = `Atlas ${r.decision} [${r.receipt_id}]: ${r.reason}`;
   if (r.decision === "deny") return deny(tag);
@@ -148,7 +190,8 @@ export function postHook(input: HookInput, engine: Engine, dataDir: string): str
   if (st.state === "pending_approval") engine.resolve(receipt, "approve", "claude-code-prompt", `tool ${input.tool_name} ran after the user accepted the permission prompt`);
   const failed = input.hook_event_name === "PostToolUseFailure" || isErrorResponse(input.tool_response);
   const authorized = (engine.log.read().find((e) => e.type === "AUTHORIZE" && `rcpt_${e.hash.slice(0, 16)}` === receipt)?.data.effects ?? []) as Effect[];
-  engine.commit({ receipt_id: receipt, outcome: failed ? "failure" : "success", effects: authorized, note: "recorded by PostToolUse hook; effects as classified, not independently observed" });
+  // late: the tool has already run, so record it even if the receipt expired or its grant was revoked meanwhile.
+  engine.commit({ receipt_id: receipt, outcome: failed ? "failure" : "success", effects: authorized, late: true, note: "recorded by PostToolUse hook; effects as classified, not independently observed" });
   return receipt;
 }
 
@@ -162,8 +205,21 @@ function pendingPath(dataDir: string, id: string): string {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   return join(dir, `${safeId(id)}.json`);
 }
+/** Markers older than this belong to calls that never reported back (a prompt the user declined, a killed session). */
+export const PENDING_MAX_AGE_MS = 24 * 3_600_000;
+
 function savePending(dataDir: string, id: string, receipt: string): void {
-  writeFileSync(pendingPath(dataDir, id), JSON.stringify({ receipt_id: receipt }), { mode: 0o600 });
+  const path = pendingPath(dataDir, id);
+  writeFileSync(path, JSON.stringify({ receipt_id: receipt }), { mode: 0o600 });
+  sweepPending(join(dataDir, "hook-pending"));
+}
+export function sweepPending(dir: string, now = Date.now()): void {
+  try {
+    for (const f of readdirSync(dir)) {
+      const p = join(dir, f);
+      try { if (now - statSync(p).mtimeMs > PENDING_MAX_AGE_MS) unlinkSync(p); } catch { /* raced with another hook */ }
+    }
+  } catch { /* nothing to sweep */ }
 }
 function takePending(dataDir: string, id: string): string | undefined {
   const p = pendingPath(dataDir, id);

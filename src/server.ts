@@ -61,7 +61,7 @@ export const toolDefinitions: Tool[] = [
     name: "atlas_receipt_status",
     title: "Check Receipt Status",
     description:
-      "Check a receipt: ready, pending_approval (escalated, waiting for a human), rejected, denied, committed or expired. " +
+      "Check a receipt: ready, pending_approval (escalated, waiting for a human), rejected, denied, committed, expired, or revoked (a grant behind it was revoked). " +
       "Approval can only be given by a human through the atlas-mcp CLI, never through this server.",
     inputSchema: { type: "object", properties: { receipt_id: { type: "string" } }, required: ["receipt_id"] },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },

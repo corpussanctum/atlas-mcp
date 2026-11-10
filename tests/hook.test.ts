@@ -1,15 +1,15 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AuditLog } from "../src/audit.js";
 import { Engine } from "../src/engine.js";
-import { issueGrant } from "../src/grants.js";
+import { issueGrant, revokeGrant } from "../src/grants.js";
 import { Issuer } from "../src/keys.js";
-import { classify, postHook, preHook, type HookConfig } from "../src/hook.js";
+import { classify, isExempt, PENDING_MAX_AGE_MS, postHook, preHook, sweepPending, type HookConfig } from "../src/hook.js";
 
 let dir: string;
 let engine: Engine;
@@ -45,6 +45,21 @@ describe("classify", () => {
     assert.equal(classify(cfg, "mcp__atlas__atlas_authorize", {}), null);
     assert.equal(classify(cfg, "SomethingNew", {}), null);
   });
+  it("exempts only Atlas's own MCP tools, not servers that share the name prefix", () => {
+    assert.equal(isExempt("mcp__atlas__atlas_authorize"), true);
+    assert.equal(isExempt("mcp__atlas-mcp__atlas_verify_audit"), true);
+    assert.equal(isExempt("mcp__atlassian__createJiraIssue"), false);
+    assert.equal(isExempt("mcp__atlas__something_else"), false);
+    assert.equal(classify(cfg, "mcp__atlassian__createJiraIssue", {})?.action, "mcp.atlassian.createJiraIssue");
+  });
+  it("recognises environment words next to underscores, digits and punctuation", () => {
+    const env = (command: string) => classify(cfg, "Bash", { command })?.effects[0].environment;
+    for (const c of ["psql $PROD_DATABASE_URL -c 'select 1'", "psql -h db_prod.internal", "psql myapp_production", "kubectl --context=prod1 get pods", "psql prod-db", "deploy --env=PRD"]) {
+      assert.equal(env(c), "production", c);
+    }
+    for (const c of ["psql $STAGING_URL", "ssh app_stg2"]) assert.equal(env(c), "staging", c);
+    for (const c of ["npm run reproduce", "ls products/", "node nonprod.js", "cat upstage.txt"]) assert.equal(env(c), "dev", c);
+  });
   it("applies custom rules before built-ins", () => {
     const c = { ...cfg, rules: [{ tool: "^Bash$", match: "^make release", action: "shell.deploy", effect_type: "deploy" }] };
     assert.equal(classify(c, "Bash", { command: "make release" })?.action, "shell.deploy");
@@ -70,6 +85,48 @@ describe("preHook", () => {
     const out = pre({ tool_name: "Edit", tool_input: { file_path: join(dir, "hook.json") }, tool_use_id: "t" });
     assert.equal(out?.hookSpecificOutput.permissionDecision, "deny");
     assert.match(out!.hookSpecificOutput.permissionDecisionReason, /own authority/);
+  });
+  it("denies production named through an environment variable or host", () => {
+    for (const c of ["psql $PROD_DATABASE_URL -c 'select 1'", "psql -h db_prod.internal"]) {
+      assert.equal(pre(bash(c))?.hookSpecificOutput.permissionDecision, "deny", c);
+    }
+  });
+  it("denies reads of Atlas's data directory, including through exempt tools", () => {
+    const decision = (tool_name: string, tool_input: object, cwd?: string) => pre({ tool_name, tool_input, cwd, tool_use_id: "t" })?.hookSpecificOutput.permissionDecision;
+    assert.equal(decision("Read", { file_path: join(dir, "issuer.json") }), "deny");
+    assert.equal(decision("Read", { file_path: "issuer.json" }, dir), "deny");
+    assert.equal(decision("Grep", { pattern: "secret", path: dir }), "deny");
+    assert.equal(decision("Glob", { pattern: "/home/u/.atlas-mcp/*" }), "deny");
+    // Ordinary reads stay ungated, and file content or a search regex is not a path.
+    assert.equal(pre({ tool_name: "Read", tool_input: { file_path: "/srv/app/a.ts" } }), null);
+    assert.equal(pre({ tool_name: "Grep", tool_input: { pattern: "\\.atlas-mcp", path: "/srv/app" } }), null);
+    assert.equal(pre({ tool_name: "Write", tool_input: { file_path: "/srv/app/README.md", content: "data lives in ~/.atlas-mcp" }, tool_use_id: "w" }), null);
+  });
+  it("denies MCP tools whose arguments reach Atlas's data directory", () => {
+    cfg.delegation_chain = [issueGrant(Issuer.loadOrCreate(dir), engine.log, { grantor: "user:alice", subject: "agent:cc", ttlHours: 1, scope: { allow: ["mcp.*"] } }).id];
+    const fsWrite = (path: string) => pre({ tool_name: "mcp__filesystem__write_file", tool_input: { path, content: "" }, tool_use_id: "m" });
+    const out = fsWrite(join(dir, "audit.jsonl"));
+    assert.equal(out?.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(out!.hookSpecificOutput.permissionDecisionReason, /own authority/);
+    assert.equal(pre({ tool_name: "mcp__fs__edit", tool_input: { edits: [{ target: { path: "/home/u/.atlas-mcp/hook.json" } }] }, tool_use_id: "m" })?.hookSpecificOutput.permissionDecision, "deny");
+    assert.equal(fsWrite("/srv/app/a.ts"), null);
+  });
+  it("denies the Atlas CLI commands that change authority", () => {
+    const before = engine.log.read().length;
+    for (const c of [
+      "atlas-mcp grant --principal user:alice --subject agent:cc --allow '*'",
+      "atlas-mcp resolve rcpt_0123456789abcdef approve",
+      "npx -y @corpussanctum/atlas-mcp revoke grt_000000000000",
+      "npx -y @corpussanctum/atlas-mcp@0.1.1 grant --principal p --subject s --allow x",
+      "cd /tmp && atlas-mcp hook init --force --env dev,staging,live",
+    ]) {
+      const out = pre(bash(c));
+      assert.equal(out?.hookSpecificOutput.permissionDecision, "deny", c);
+      assert.match(out!.hookSpecificOutput.permissionDecisionReason, /only the human operator/, c);
+    }
+    assert.equal(engine.log.read().length, before, "refused before reaching the engine");
+    // Read-only subcommands and installing the package stay available.
+    for (const c of ["atlas-mcp verify", "atlas-mcp status rcpt_0123456789abcdef", "npm i -g @corpussanctum/atlas-mcp"]) assert.equal(pre(bash(c)), null, c);
   });
   it("denies when the delegation has been revoked or expired", () => {
     cfg.delegation_chain = ["grt_000000000000"];
@@ -97,6 +154,30 @@ describe("postHook", () => {
     postHook({ tool_name: "Bash", tool_use_id: "t3", hook_event_name: "PostToolUseFailure" }, engine, dir);
     assert.equal(engine.log.read().at(-1)?.data.outcome, "failure");
   });
+  it("still records a call whose grant was revoked while it ran, as a violation", () => {
+    pre(bash("npm test", "t4"));
+    revokeGrant(engine.log, cfg.delegation_chain[0], "pulled mid-run");
+    assert.ok(postHook({ tool_name: "Bash", tool_use_id: "t4" }, engine, dir));
+    const last = engine.log.read().at(-1)!;
+    assert.equal(last.type, "COMMIT");
+    assert.equal(last.data.receipt_state, "revoked");
+    assert.deepEqual(readdirSync(join(dir, "hook-pending")), []);
+  });
+  it("leaves no pending marker for a denied call, and sweeps markers that were never collected", () => {
+    assert.equal(pre(bash("psql production", "t5"))?.hookSpecificOutput.permissionDecision, "deny");
+    assert.equal(existsSync(join(dir, "hook-pending", "t5.json")), false);
+
+    const pending = join(dir, "hook-pending");
+    pre(bash("rm -rf dist", "declined")); // escalated; suppose the user declines the prompt
+    const old = new Date(Date.now() - PENDING_MAX_AGE_MS - 60_000);
+    utimesSync(join(pending, "declined.json"), old, old);
+    pre(bash("npm test", "fresh"));
+    assert.deepEqual(readdirSync(pending), ["fresh.json"]);
+
+    writeFileSync(join(pending, "x.json"), "{}");
+    sweepPending(pending, Date.now() + PENDING_MAX_AGE_MS + 60_000);
+    assert.deepEqual(readdirSync(pending), []);
+  });
   it("ignores calls Atlas never saw", () => {
     assert.equal(postHook({ tool_name: "Bash", tool_use_id: "unknown" }, engine, dir), null);
   });
@@ -116,12 +197,19 @@ describe("CLI hook", () => {
       assert.equal(gated.status, 0);
       assert.equal(JSON.parse(gated.stdout).hookSpecificOutput.permissionDecision, "deny");
       assert.equal(go({ tool_name: "Read", tool_input: { file_path: "x" } }).stdout, "");
+      const key = go({ tool_name: "Read", tool_input: { file_path: join(fresh, "issuer.json") } });
+      assert.equal(JSON.parse(key.stdout).hookSpecificOutput.permissionDecision, "deny");
     } finally { rmSync(fresh, { recursive: true, force: true }); }
   });
 
   it("init writes a config, then pre denies production end to end", () => {
     const out = execFileSync(process.execPath, [BIN, "hook", "init", "--principal", "user:alice"], { env: env(), encoding: "utf-8" });
     assert.match(out, /"PreToolUse"/);
+    const settings = JSON.parse(out.slice(out.indexOf("{")));
+    assert.equal(settings.hooks.PostToolUseFailure[0].hooks[0].command, "atlas-mcp hook post");
+    assert.equal(settings.hooks.PostToolUseFailure[0].matcher, settings.hooks.PostToolUse[0].matcher);
+    assert.match(out, /"matcher": "Bash\|Read\|Grep\|Glob\|/);
+    assert.equal(JSON.parse(run("pre", { tool_name: "Read", tool_input: { file_path: join(dir, "issuer.json") } }).stdout).hookSpecificOutput.permissionDecision, "deny");
     assert.ok(existsSync(join(dir, "hook.json")));
     assert.throws(() => execFileSync(process.execPath, [BIN, "hook", "init"], { env: env(), stdio: "pipe" }), /exists/);
     const r = run("pre", bash("kubectl get pods -n production"));
