@@ -93,6 +93,8 @@ export function verifyChain(
 
   const revoked = revokedIds(log);
   const chain: Grant[] = [];
+  // Revocation anywhere in the chain outranks expiry: an expired link must not hide that authority was withdrawn.
+  let expired: ChainResult | undefined;
   for (const ref of refs) {
     const id = typeof ref === "string" ? ref : ref?.id;
     // Always trust the issuer-recorded copy, never the caller's copy of a grant.
@@ -101,9 +103,10 @@ export function verifyChain(
     const { issuer_key_id, signature, ...body } = g;
     if (issuer_key_id !== issuer.keyId || !issuer.verify(canonical(body), signature)) return { ok: false, reason: `grant ${g.id} has an invalid signature` };
     if (revoked.has(g.id)) return { ok: false, reason: `grant ${g.id} was revoked`, code: "revoked" };
-    if (now > new Date(g.expires_at)) return { ok: false, reason: `grant ${g.id} expired at ${g.expires_at}`, code: "expired" };
+    if (!expired && now > new Date(g.expires_at)) expired = { ok: false, reason: `grant ${g.id} expired at ${g.expires_at}`, code: "expired" };
     chain.push(g);
   }
+  if (expired) return expired;
 
   if (chain[0].grantor !== principal) {
     return { ok: false, reason: `chain starts at '${chain[0].grantor}', not the stated principal '${principal}'` };

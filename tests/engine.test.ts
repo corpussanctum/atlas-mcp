@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdtempSync, readdirSync, rmSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readdirSync, rmSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -238,6 +238,15 @@ describe("escalation, commit, receipts", () => {
     assert.equal(v.status, "violation");
     assert.equal(v.receipt_state, "revoked");
 
+    // A revoked link is reported even when an earlier link has also expired meanwhile.
+    const parent = grant("user:tj", "agent:orch", { allow: ["db.*"] }, 0.1);
+    const child = grant("agent:orch", "agent:worker", { allow: ["db.read"] });
+    const both = ask("db.read", [], [parent.id, child.id], "agent:worker");
+    revokeGrant(log, child.id, "x");
+    const afterExpiry = new Date(Date.now() + 10 * 60_000);
+    assert.equal(engine.status(both.receipt_id, afterExpiry).state, "revoked");
+    assert.equal(engine.commit({ receipt_id: both.receipt_id, outcome: "success", late: true }, afterExpiry).status, "violation");
+
     // late never rescues a receipt that was not usable in the first place.
     const denied = ask("net.fetch", [], [g.id]);
     assert.throws(() => engine.commit({ receipt_id: denied.receipt_id, outcome: "success", late: true }), /denied/);
@@ -358,6 +367,23 @@ describe("audit log: truncation, interrupted writes, corruption", () => {
       assert.match(v.reason!, /line 2 is not a valid audit entry/, junk);
       assert.throws(() => ask("y", [], [g.id]), /corrupt at line 2/, junk);
     }
+  });
+
+  it("verifies the bytes on disk even when an edit restores the file's size and timestamps", () => {
+    seed();
+    const stamp = new Date(Date.now() - 60_000); // a whole-millisecond time that utimes can restore exactly
+    utimesSync(log.path, stamp, stamp);
+    assert.equal(log.verify().valid, true);
+    assert.equal(log.read().length, 2); // the parse is now remembered
+    const before = statSync(log.path);
+    const text = readFileSync(log.path, "utf-8");
+    writeFileSync(log.path, text.replace('"requested_action":"x"', '"requested_action":"z"'));
+    utimesSync(log.path, stamp, stamp);
+    const after = statSync(log.path);
+    assert.deepEqual([after.size, after.mtimeMs], [before.size, before.mtimeMs]);
+    const v = log.verify();
+    assert.equal(v.valid, false);
+    assert.match(v.reason!, /hash mismatch/);
   });
 
   it("sees entries appended by another process without re-reading an unchanged file", () => {

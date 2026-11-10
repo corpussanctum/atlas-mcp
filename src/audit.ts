@@ -61,7 +61,7 @@ export class AuditLog {
   readonly path: string;
   readonly headPath: string;
   private readonly lock: string;
-  private cache?: { size: number; mtimeMs: number; ino: number; loaded: Loaded };
+  private cache?: { size: number; mtimeMs: number; ctimeMs: number; ino: number; loaded: Loaded };
 
   constructor(dataDir: string, private readonly issuer: Issuer) {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
@@ -110,7 +110,8 @@ export class AuditLog {
   }
 
   verify(): VerifyResult {
-    const l = this.load();
+    // Verification must judge the bytes on disk, never a remembered parse: file metadata can be put back after an edit.
+    const l = this.load(true);
     const entries = l.entries;
     let prev = GENESIS;
     for (const [i, e] of entries.entries()) {
@@ -132,8 +133,8 @@ export class AuditLog {
     return { valid: true, entries: entries.length, ...(warnings.length ? { warning: warnings.join("; ") } : {}) };
   }
 
-  /** Parse the log, reusing the previous parse while the file is unchanged. */
-  private load(): Loaded {
+  /** Parse the log, reusing the previous parse while the file is unchanged (unless `fresh`). */
+  private load(fresh = false): Loaded {
     // Stat and read through one descriptor, so the cache key describes the same file the bytes came from.
     let fd: number;
     try { fd = openSync(this.path, "r"); } catch { return { entries: [], goodBytes: 0, torn: false }; }
@@ -141,7 +142,7 @@ export class AuditLog {
     try {
       st = fstatSync(fd);
       const c = this.cache;
-      if (c && c.size === st.size && c.mtimeMs === st.mtimeMs && c.ino === st.ino) return c.loaded;
+      if (!fresh && c && c.size === st.size && c.mtimeMs === st.mtimeMs && c.ctimeMs === st.ctimeMs && c.ino === st.ino) return c.loaded;
       raw = readFileSync(fd);
     } finally {
       closeSync(fd);
@@ -156,7 +157,7 @@ export class AuditLog {
       if (!e) { loaded.corruptLine = i + 1; break; }
       loaded.entries.push(e);
     }
-    this.cache = { size: st.size, mtimeMs: st.mtimeMs, ino: st.ino, loaded };
+    this.cache = { size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, ino: st.ino, loaded };
     return loaded;
   }
 
@@ -168,7 +169,7 @@ export class AuditLog {
     if (st.size !== expectedSize) return; // someone else wrote too: re-read next time
     loaded.entries.push(entry);
     loaded.goodBytes = st.size;
-    this.cache = { size: st.size, mtimeMs: st.mtimeMs, ino: st.ino, loaded };
+    this.cache = { size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, ino: st.ino, loaded };
   }
 
   /**
