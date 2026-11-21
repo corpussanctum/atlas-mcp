@@ -50,7 +50,7 @@ npx -y @corpussanctum/atlas-mcp grant --principal user:alice --subject agent:cla
 
 **3. Tell the agent the rules.** Add to `CLAUDE.md` / `AGENTS.md` (see [`examples/CLAUDE.md.snippet`](examples/CLAUDE.md.snippet)):
 
-> Before any destructive, production, deploy or spending action, call `atlas_authorize` with agent `agent:claude`, principal `user:alice`, delegation_chain `["grt_…"]`, the action and every effect. Proceed only on `permit`. Afterwards call `atlas_commit_effect`.
+> Before any destructive, production, deploy or spending action, call `atlas_authorize` with agent `agent:claude`, principal `user:alice`, delegation_chain `["grt_…"]`, the action and every effect. Proceed only on `permit`. Afterwards call `atlas_commit_effect`. For database work, prefer a trusted effect-derivation adapter in `observed` mode so effects come from the SQL rather than from the agent (see [the enforcement contract](docs/enforcement-contract.md)).
 
 **4. Approve escalations as the human.** Approval is deliberately **not** an MCP tool, so an agent cannot approve itself:
 ```bash
@@ -62,9 +62,10 @@ npx -y @corpussanctum/atlas-mcp verify            # check the audit chain and si
 
 | Tool | Purpose |
 |---|---|
-| `atlas_authorize` | `{agent, principal, requested_action, effects[], delegation_chain[]}` → `{decision, reason, scope, receipt_id}` |
-| `atlas_commit_effect` | Report what actually happened under a receipt. One commit per receipt. Effects the receipt never covered are flagged as `violation`. |
+| `atlas_authorize` | `{agent, principal, requested_action, effects[], delegation_chain[], enforcement?}` → `{decision, reason, scope, receipt_id}`; `enforcement.mode: "observed"` binds the receipt to an operation hash and a trusted observer |
+| `atlas_commit_effect` | Report what actually happened under a receipt. One commit per receipt. Effects the receipt never covered are flagged as `violation`; observed receipts require the enforcement point's `attestation` instead of caller claims. |
 | `atlas_receipt_status` | `ready`, `pending_approval`, `rejected`, `denied`, `committed`, `expired`, `revoked` |
+| `atlas_pending_permits` | List permitted receipts with no commit, with `alert`, `age_ms`, `state` and observer; for operator monitoring, not agent use |
 | `atlas_verify_audit` | Verify the SHA3-256 chain, every ML-DSA-65 signature, and that the log still reaches its signed head |
 
 ## How decisions work
@@ -74,6 +75,7 @@ npx -y @corpussanctum/atlas-mcp verify            # check the audit chain and si
 * **Intersection semantics:** every link must independently allow the action and each effect. Revoking any link kills everything below it, including receipts already issued but not yet committed (they become `revoked`).
 * **Fail closed:** unknown grants, bad signatures, missing environments under an environment-restricted grant, a request with no effects under an environment- or resource-restricted grant, and malformed requests all deny. The server trusts its own recorded copy of a grant, never the caller's.
 * Receipts expire after 15 minutes. A permit/approval covers the stated effects only.
+* **Observed mode (F1):** an enforcement point derives effects from the operation, binds the receipt to an operation hash, and commits an independent observation. Caller-reported effects alone cannot satisfy that receipt, and declared mutations that were never observed become `violation`. `atlas-mcp pending` alerts on permits with no commit. See [docs/enforcement-contract.md](docs/enforcement-contract.md).
 
 ## Enforce it: the Claude Code hook
 
@@ -122,7 +124,7 @@ Edit `~/.atlas-mcp/hook.json`:
 ### What it does not do (read this)
 
 * **Classification is pattern matching.** A command Atlas doesn't recognise is plain `shell.exec`, and environment is inferred from words in the command (`prod`, `production`, `staging`, also inside names such as `PROD_DB_URL` or `db_prod`). `./deploy.sh` or a connection string with no environment word passes as `dev`. Add `rules` and `environments` for your own tooling. This is a speed bump against mistakes and a record for audit, not a defence against an agent actively hiding its intent.
-* **Effects are as classified, not observed.** The audit log records what Atlas judged the call would do, not what the process really did.
+* **In declared mode, effects are as classified, not observed.** The audit log records what Atlas judged the call would do, not what the process really did. Database work should use the [reference SQL adapter](docs/enforcement-contract.md) with `observed` mode and an independent observation source; other tools still need their own enforcement point.
 * **Hook failures.** The hook answers `deny` when it can catch its own error (missing config, bad grant). A hard crash or timeout is not blocked by Claude Code unless your build supports `"onFailure": "block"` on the hook handler (documented for recent versions); add it to both hook entries if yours does.
 * **Permission modes.** Claude Code's docs don't say whether a hook `deny` survives `--permission-mode bypassPermissions`. We tested it on Claude Code 2.1.296 (Claude Code): a denied command did not run under `bypassPermissions` (the control command ran and was committed). Retest after upgrading Claude Code.
 * **Self-protection is partial.** Reads and edits of `~/.atlas-mcp`, commands and MCP tool arguments that name it, and the `atlas-mcp grant`, `revoke`, `resolve` and `hook init` commands are refused, but a shell can reach a file or a binary by many routes. Reads are only checked if `Read|Grep|Glob` are in your `PreToolUse` matcher: if you set the hook up before this was added, update the matcher to the one `hook init` prints. Run agents as a different OS user from the one that owns the data directory if that matters to you.
@@ -130,7 +132,7 @@ Edit `~/.atlas-mcp/hook.json`:
 
 ## Read this before you rely on it
 
-* **This is a gate the agent consults, not a sandbox.** On its own, an MCP tool cannot stop an agent that decides not to call it, or that lies about its effects. v0.1 gives you a signed, verifiable record and a decision to enforce *with*: for Claude Code, use the hook above to make it binding; elsewhere pair it with a tool proxy or network/credential isolation. `atlas_commit_effect` catches and records the mismatches it is told about.
+* **This is a gate the agent consults, not a sandbox.** On its own, an MCP tool cannot stop an agent that decides not to call it, or that lies about its effects. v0.1 gives you a signed, verifiable record and a decision to enforce *with*: for Claude Code, use the hook above to make it binding; elsewhere pair it with a tool proxy or network/credential isolation. In declared mode `atlas_commit_effect` only records the mismatches it is told about; observed mode adds a binding operation hash and an independent observer attestation, but still depends on that observer being separate from the agent.
 * The issuer key sits unencrypted in `~/.atlas-mcp/issuer.json` (mode 0600). Protect the directory like an SSH key. Anyone who can read it can forge grants.
 * **The audit log detects edits, removals, reordering and truncation.** A signed head (`audit.head`) records the newest entry, so `verify` notices entries cut from the end, and Atlas refuses to authorize or append on top of a shortened log. Deleting the head file from a non-empty log is also a hard verification failure. Keep `audit.head` somewhere the agent's account cannot write for stronger evidence.
 * Local operator approval = local shell access. There is no remote approval channel in v0.1.
@@ -138,7 +140,7 @@ Edit `~/.atlas-mcp/hook.json`:
 
 ## Data and config
 
-`ATLAS_MCP_DATA_DIR` (default `~/.atlas-mcp`) holds `issuer.json`, `audit.jsonl` and its signed head `audit.head`. Nothing leaves the machine.
+`ATLAS_MCP_DATA_DIR` (default `~/.atlas-mcp`) holds `issuer.json`, `audit.jsonl`, its signed head `audit.head`, and optionally `enforcement.json` (observer policy). `ATLAS_MCP_ENFORCEMENT` can supply the same JSON from the environment. Nothing leaves the machine. `atlas-mcp observer-keygen` prints a dedicated observer keypair; keep its secret outside the agent's account and publish only the public half in policy.
 
 ## Docker
 
@@ -156,5 +158,7 @@ docker run -i --rm -v atlas-data:/data atlas-mcp
 ```bash
 npm install && npm test
 ```
+
+The test suite includes the F2 SQL conformance matrix (`tests/conformance/sql-cases.ts`). See [docs/enforcement-contract.md](docs/enforcement-contract.md) for the F1 contract, configuration and adapter API.
 
 Apache-2.0.

@@ -1,19 +1,20 @@
 import { canonical, sha3 } from "./canonical.js";
 import { canonicalAction, matchAction } from "./actions.js";
-import { matchAny, matchGlob } from "./glob.js";
+import { matchAny } from "./glob.js";
 import { verifyChain, type Grant } from "./grants.js";
 import type { AuditEntry, AuditLog } from "./audit.js";
-import type { Issuer } from "./keys.js";
+import { verifyObserverSignature, type Issuer } from "./keys.js";
+import {
+  attestationPayload,
+  effectCovers,
+  OPERATION_HASH_RE,
+  type Effect,
+  type EffectAttestation,
+  type EnforcementConfig,
+  type EnforcementContract,
+} from "./effects/contract.js";
 
-export interface Effect {
-  /** read | write | create | delete | exec | send | spend ... free-form */
-  type: string;
-  /** What is touched, e.g. `postgres://prod/users`. */
-  resource: string;
-  /** e.g. `staging`, `production`. Required when any grant restricts environments. */
-  environment?: string;
-  irreversible?: boolean;
-}
+export type { Effect } from "./effects/contract.js";
 
 export interface AuthorizeRequest {
   agent: string;
@@ -21,6 +22,8 @@ export interface AuthorizeRequest {
   requested_action: string;
   effects: Effect[];
   delegation_chain: Array<string | Grant>;
+  /** Optional F1 contract. Unset means legacy declared-effects behaviour. */
+  enforcement?: EnforcementContract;
 }
 
 export type Decision = "permit" | "deny" | "escalate";
@@ -39,10 +42,14 @@ export class Engine {
   constructor(
     private readonly issuer: Issuer,
     readonly log: AuditLog,
+    private readonly enforcement: Readonly<EnforcementConfig> = {},
   ) {}
 
   authorize(req: AuthorizeRequest, now = new Date()): AuthorizeResult {
-    const [decision, reason, scope] = this.decide(req, now);
+    const contractProblem = this.validateContract(req.enforcement);
+    const [decision, reason, scope] = contractProblem
+      ? (["deny", contractProblem, "none"] as const)
+      : this.decide(req, now);
     const expires = decision === "deny" ? undefined : new Date(now.getTime() + RECEIPT_TTL_MS).toISOString();
     const entry = this.log.append("AUTHORIZE", {
       agent: req.agent,
@@ -56,8 +63,30 @@ export class Engine {
       reason,
       scope,
       expires_at: expires,
+      ...(req.enforcement ? { enforcement: req.enforcement } : {}),
     });
     return { decision, reason, scope, receipt_id: receiptId(entry), expires_at: expires };
+  }
+
+  /** Contracts are checked before policy: a malformed observed receipt is never issued. */
+  private validateContract(contract?: EnforcementContract): string | undefined {
+    if (!contract) {
+      return this.enforcement.mode === "observed"
+        ? "an observed enforcement contract (observer + operation_hash) is required by server policy"
+        : undefined;
+    }
+    if (contract.mode !== "declared" && contract.mode !== "observed") return "enforcement.mode must be declared or observed";
+    if (this.enforcement.mode === "observed" && contract.mode !== "observed") return "server policy requires mode 'observed'";
+    if (contract.mode !== "observed") return undefined;
+    if (typeof contract.observer !== "string" || !contract.observer.trim()) return "observed enforcement requires an observer id";
+    if (typeof contract.operation_hash !== "string" || !OPERATION_HASH_RE.test(contract.operation_hash)) {
+      return "observed enforcement requires operation_hash (64 lowercase hex characters)";
+    }
+    const trusted = this.enforcement.trustedObservers;
+    if (trusted?.length && !trusted.includes(contract.observer)) {
+      return `observer '${contract.observer}' is not in the configured trusted observer list`;
+    }
+    return undefined;
   }
 
   private decide(req: AuthorizeRequest, now: Date): [Decision, string, string] {
@@ -145,11 +174,22 @@ export class Engine {
    * grant was revoked while the action was running. The state is recorded, and
    * a commit under revoked authority counts as a violation.
    */
-  commit(p: { receipt_id: string; outcome: "success" | "failure"; effects?: Effect[]; note?: string; late?: boolean }, now = new Date()) {
+  commit(p: {
+    receipt_id: string;
+    outcome: "success" | "failure";
+    effects?: Effect[];
+    note?: string;
+    late?: boolean;
+    /** Required when the receipt carries an observed enforcement contract. */
+    attestation?: EffectAttestation;
+  }, now = new Date()) {
     // The receipt state check and the append share one audit-lock critical
     // section, so two processes cannot both observe `ready` and commit (F5).
     let state: string | undefined;
     let violations: Effect[] = [];
+    let missing: Effect[] = [];
+    let observedBy: string | undefined;
+    let operationHash: string | undefined;
     const result = this.log.appendGuarded("COMMIT", () => {
       const auth = this.findAuthorize(p.receipt_id);
       if (!auth) return { error: `unknown receipt ${p.receipt_id}` };
@@ -159,8 +199,43 @@ export class Engine {
       if (st !== "ready" && !lateOk) return { error: `receipt ${p.receipt_id} cannot be committed: state is '${st}'` };
 
       const authorized = auth.data.effects as Effect[];
-      const observed = p.effects ?? [];
-      violations = observed.filter((o) => !authorized.some((a) => a.type === o.type && a.environment === o.environment && matchGlob(a.resource, o.resource)));
+      const contract = auth.data.enforcement as EnforcementContract | undefined;
+      let observed = p.effects ?? [];
+      let attestationData: Record<string, unknown> = {};
+
+      if (contract?.mode === "observed") {
+        const att = p.attestation;
+        if (!att) return { error: `receipt ${p.receipt_id} requires an observer attestation (F1 contract)` };
+        if (att.observer !== contract.observer) return { error: `attestation observer '${att.observer}' does not match receipt observer '${contract.observer}'` };
+        if (att.operation_hash !== contract.operation_hash) return { error: `attestation operation_hash does not match the receipt` };
+        if (!Array.isArray(att.effects)) return { error: "attestation.effects must be an array (use [] when nothing was observed)" };
+        const trusted = this.enforcement.trustedObservers;
+        if (trusted?.length && !trusted.includes(att.observer)) return { error: `observer '${att.observer}' is not trusted by server policy` };
+        const publicKey = this.enforcement.observerPublicKeys?.[att.observer];
+        if (publicKey) {
+          if (!att.signature) return { error: `observer '${att.observer}' requires a signed attestation` };
+          const payload = attestationPayload({ receipt_id: p.receipt_id, ...att });
+          if (!verifyObserverSignature(publicKey, payload, att.signature)) return { error: "observer attestation signature is invalid" };
+        }
+        observed = att.effects;
+        observedBy = att.observer;
+        operationHash = att.operation_hash;
+        // A successful mutation that the observer never saw is as serious as an
+        // effect the receipt never covered. Reads are bound by operation_hash:
+        // trigger-based observers cannot attest them, so they are not required.
+        missing = p.outcome === "success"
+          ? authorized.filter((a) => a.type !== "read" && !observed.some((o) => effectCovers(a, o)))
+          : [];
+        attestationData = {
+          observed_by: att.observer,
+          operation_hash: att.operation_hash,
+          attestation: att,
+          missing_effects: missing,
+          enforcement_mode: "observed",
+        };
+      }
+
+      violations = observed.filter((o) => !authorized.some((a) => effectCovers(a, o)));
       state = st;
       return {
         data: {
@@ -170,6 +245,7 @@ export class Engine {
           violations,
           note: p.note,
           ...(st !== "ready" ? { receipt_state: st } : {}),
+          ...attestationData,
         },
       };
     });
@@ -178,11 +254,44 @@ export class Engine {
     const st = state!;
     return {
       commit_id: `cmt_${entry.hash.slice(0, 16)}`,
-      status: violations.length || st === "revoked" ? "violation" : "recorded",
+      status: violations.length || missing.length || st === "revoked" ? "violation" : "recorded",
       violations,
       audit_seq: entry.seq,
       ...(st !== "ready" ? { receipt_state: st } : {}),
+      ...(observedBy ? { observed_by: observedBy, operation_hash: operationHash, missing_effects: missing } : {}),
     };
+  }
+
+  /**
+   * Uncommitted permits are an alertable state, not a neutral one (F1): a
+   * permit with no matching COMMIT may mean the action ran outside Atlas.
+   * `olderThanMs` lets monitoring separate in-flight calls from stale receipts.
+   */
+  pendingPermits(now = new Date(), olderThanMs = 0): Array<Record<string, unknown>> {
+    const entries = this.log.read();
+    const committed = new Set(entries.filter((e) => e.type === "COMMIT").map((e) => e.data.receipt_id));
+    return entries
+      .filter((e) => e.type === "AUTHORIZE" && e.data.decision !== "deny" && !committed.has(receiptId(e)))
+      .map((e) => {
+        const receipt = receiptId(e);
+        const st = this.status(receipt, now);
+        const contract = e.data.enforcement as EnforcementContract | undefined;
+        const issuedAt = new Date(e.data.expires_at as string).getTime() - RECEIPT_TTL_MS;
+        const ageMs = Math.max(0, now.getTime() - issuedAt);
+        const alert = st.state === "expired" || st.state === "revoked" || (st.state === "ready" && ageMs >= olderThanMs);
+        return {
+          receipt_id: receipt,
+          state: st.state,
+          decision: e.data.decision,
+          requested_action: e.data.requested_action,
+          expires_at: e.data.expires_at,
+          age_ms: ageMs,
+          enforcement_mode: contract?.mode ?? "declared",
+          ...(contract?.observer ? { observer: contract.observer } : {}),
+          alert,
+        };
+      })
+      .filter((p) => p.state !== "pending_approval" && p.state !== "rejected");
   }
 
   private findAuthorize(receipt: string) {

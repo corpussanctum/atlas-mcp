@@ -19,7 +19,7 @@ In scope: the authorization engine, delegation-chain and grant verification, rec
 These are disclosed design limits, not vulnerabilities:
 
 - The issuer private key is stored unencrypted at `~/.atlas-mcp/issuer.json` (mode `0600`, not hardware- or OS-keychain-backed). Anyone who can read that file can forge grants. Protect the data directory (mode `0700`) and the account that owns it.
-- Atlas authorizes actions that an agent reports to it. It does not sandbox the agent or intercept actions the agent never submits.
+- In `declared` mode Atlas authorizes the action an agent reports to it; it does not sandbox the agent, verify the reported effects, or intercept actions the agent never submits. `observed` mode (see `docs/enforcement-contract.md`) binds a receipt to an operation hash and requires an independent observer attestation at commit, and `atlas_pending_permits` alerts on permits with no commit. The guarantee still depends on the observer being a separate, uncompromised process; see the deployment notes in that document.
 
 ## Supply chain
 

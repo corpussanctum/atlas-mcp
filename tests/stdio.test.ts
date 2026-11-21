@@ -47,9 +47,9 @@ describe("MCP stdio", () => {
   });
   after(() => { proc.kill(); rmSync(dir, { recursive: true, force: true }); });
 
-  it("lists the four tools with annotations and keeps stdout clean", async () => {
+  it("lists the five tools with annotations and keeps stdout clean", async () => {
     const r = await rpc("tools/list");
-    assert.deepEqual(r.result.tools.map((t: any) => t.name), ["atlas_authorize", "atlas_commit_effect", "atlas_receipt_status", "atlas_verify_audit"]);
+    assert.deepEqual(r.result.tools.map((t: any) => t.name), ["atlas_authorize", "atlas_commit_effect", "atlas_receipt_status", "atlas_pending_permits", "atlas_verify_audit"]);
     for (const t of r.result.tools) assert.equal(typeof t.annotations.readOnlyHint, "boolean");
     assert.deepEqual(stray, []);
   });
@@ -69,6 +69,29 @@ describe("MCP stdio", () => {
     assert.equal((await call("atlas_commit_effect", { receipt_id: stg.body.receipt_id, outcome: "success" })).isError, true);
 
     assert.deepEqual((await call("atlas_verify_audit", {})).body, { valid: true, entries: 4 });
+  });
+
+  it("enforces an observed contract over MCP and exposes uncommitted permits", async () => {
+    const grant = JSON.parse(execFileSync(process.execPath, [BIN, "grant", "--principal", "user:tj", "--subject", "agent:claude", "--allow", "db.*", "--env", "staging"], { env: { ...process.env, ATLAS_MCP_DATA_DIR: dir } }).toString());
+    const effects = [{ type: "read", resource: "sqlite://staging/users.db", environment: "staging" }];
+    const enforcement = { mode: "observed", observer: "test-observer/1.0.0", operation_hash: "a".repeat(64) };
+    const auth = await call("atlas_authorize", {
+      agent: "agent:claude", principal: "user:tj", requested_action: "db.read",
+      effects, delegation_chain: [grant.id], enforcement,
+    });
+    assert.equal(auth.body.decision, "permit");
+
+    const claimed = await call("atlas_commit_effect", { receipt_id: auth.body.receipt_id, outcome: "success", effects });
+    assert.equal(claimed.isError, true);
+    assert.match(claimed.body.error, /observer attestation/);
+
+    const pending = await call("atlas_pending_permits", { older_than_ms: 0 });
+    assert.ok(pending.body.some((p: any) => p.receipt_id === auth.body.receipt_id && p.alert));
+
+    const attestation = { observer: enforcement.observer, operation_hash: enforcement.operation_hash, effects };
+    const committed = await call("atlas_commit_effect", { receipt_id: auth.body.receipt_id, outcome: "success", attestation });
+    assert.equal(committed.body.status, "recorded");
+    assert.equal(committed.body.observed_by, enforcement.observer);
   });
 
   it("accepts a late commit over MCP after the grant was revoked", async () => {

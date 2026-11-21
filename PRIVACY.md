@@ -15,7 +15,8 @@ Atlas stores its state locally, in `~/.atlas-mcp` by default (override with `ATL
 - your signing keys,
 - delegation grants,
 - authorization receipts,
-- the signed, hash-chained audit log, which records the actions, effects, agent and principal identifiers that you or your agent submit.
+- the signed, hash-chained audit log, which records the actions, effects, agent and principal identifiers that you or your agent submit (plus the optional observer id, operation hash and attestation signature when the F1 observed contract is used),
+- optional `enforcement.json` observer policy in the same directory.
 
 This data stays on your disk. You control it and can inspect or delete it at any time. Deleting the audit log removes the tamper-evidence it provided.
 
