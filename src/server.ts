@@ -44,7 +44,8 @@ export const toolDefinitions: Tool[] = [
     name: "atlas_commit_effect",
     title: "Report Completed Effects",
     description:
-      "After acting on a permitted receipt, report what was actually done. Atlas records it in the signed audit log and flags any effect the receipt did not cover. One commit per receipt.",
+      "After acting on a permitted receipt, report what was actually done. Atlas records it in the signed audit log and flags any effect the receipt did not cover. One commit per receipt. " +
+      "Set late to true when the action already ran and the receipt expired or its grant was revoked while it was running; the outcome is still recorded and revoked authority is flagged as a violation.",
     inputSchema: {
       type: "object",
       properties: {
@@ -52,6 +53,7 @@ export const toolDefinitions: Tool[] = [
         outcome: { type: "string", enum: ["success", "failure"] },
         effects: { type: "array", items: effectSchema, description: "Effects that actually happened" },
         note: { type: "string" },
+        late: { type: "boolean", description: "Report an action that already ran after expiry or revocation" },
       },
       required: ["receipt_id", "outcome"],
     },
@@ -83,7 +85,13 @@ export function createHandlers(engine: Engine): Record<string, (a: Args) => unkn
     atlas_authorize: (a) => text(engine.authorize(a as unknown as AuthorizeRequest)),
     atlas_commit_effect: (a) => {
       try {
-        return text(engine.commit({ receipt_id: a.receipt_id as string, outcome: a.outcome as "success" | "failure", effects: a.effects as Effect[] | undefined, note: a.note as string | undefined }));
+        return text(engine.commit({
+          receipt_id: a.receipt_id as string,
+          outcome: a.outcome as "success" | "failure",
+          effects: a.effects as Effect[] | undefined,
+          note: a.note as string | undefined,
+          late: a.late as boolean | undefined,
+        }));
       } catch (err) {
         return text({ error: (err as Error).message }, true);
       }

@@ -1,4 +1,5 @@
 import { canonical, sha3 } from "./canonical.js";
+import { canonicalAction, matchAction } from "./actions.js";
 import { matchAny, matchGlob } from "./glob.js";
 import { verifyChain, type Grant } from "./grants.js";
 import type { AuditEntry, AuditLog } from "./audit.js";
@@ -47,6 +48,7 @@ export class Engine {
       agent: req.agent,
       principal: req.principal,
       requested_action: req.requested_action,
+      canonical_action: canonicalAction(req.requested_action) ?? null,
       effects: req.effects,
       effects_hash: sha3(canonical(req.effects)),
       chain: req.delegation_chain.map((g) => (typeof g === "string" ? g : g.id)),
@@ -66,15 +68,18 @@ export class Engine {
     if (!verified.ok) return ["deny", verified.reason, "none"];
     const { chain } = verified;
     const scope = describeScope(chain);
+    // validateShape guarantees this; actions are matched in canonical form so a
+    // case or whitespace variant cannot slip past a deny rule (F3).
+    const action = canonicalAction(req.requested_action)!;
 
     // Authority is the intersection of every link: each one must independently allow the request.
     let escalateReason: string | undefined;
     for (const g of chain) {
       const s = g.scope;
-      const denied = s.deny && matchAny(s.deny, req.requested_action);
-      if (denied) return ["deny", `action '${req.requested_action}' is explicitly denied by grant ${g.id} (deny: ${denied})`, scope];
-      if (!matchAny(s.allow, req.requested_action)) {
-        return ["deny", `action '${req.requested_action}' is not delegated by grant ${g.id} (allows: ${s.allow.join(", ")})`, scope];
+      const denied = s.deny && matchAction(s.deny, action);
+      if (denied) return ["deny", `action '${action}' is explicitly denied by grant ${g.id} (deny: ${denied})`, scope];
+      if (!matchAction(s.allow, action)) {
+        return ["deny", `action '${action}' is not delegated by grant ${g.id} (allows: ${s.allow.join(", ")})`, scope];
       }
       // Fail closed: a restricted grant can only be checked against declared effects.
       if (req.effects.length === 0 && (s.environments || s.resources)) {
@@ -92,8 +97,8 @@ export class Engine {
           return ["deny", `resource '${e.resource}' is outside the scope of grant ${g.id} (${s.resources.join(", ")})`, scope];
         }
       }
-      const esc = s.escalate && matchAny(s.escalate, req.requested_action);
-      if (esc && !escalateReason) escalateReason = `action '${req.requested_action}' requires human approval under grant ${g.id} (escalate: ${esc})`;
+      const esc = s.escalate && matchAction(s.escalate, action);
+      if (esc && !escalateReason) escalateReason = `action '${action}' requires human approval under grant ${g.id} (escalate: ${esc})`;
     }
     if (escalateReason) return ["escalate", escalateReason, scope];
     return ["permit", `authorized by ${chain.length}-link delegation chain from ${req.principal}`, scope];
@@ -141,23 +146,36 @@ export class Engine {
    * a commit under revoked authority counts as a violation.
    */
   commit(p: { receipt_id: string; outcome: "success" | "failure"; effects?: Effect[]; note?: string; late?: boolean }, now = new Date()) {
-    const auth = this.findAuthorize(p.receipt_id);
-    if (!auth) throw new Error(`unknown receipt ${p.receipt_id}`);
-    const st = this.status(p.receipt_id, now).state as string;
-    const lateOk = p.late && (st === "expired" || st === "revoked");
-    if (st !== "ready" && !lateOk) throw new Error(`receipt ${p.receipt_id} cannot be committed: state is '${st}'`);
+    // The receipt state check and the append share one audit-lock critical
+    // section, so two processes cannot both observe `ready` and commit (F5).
+    let state: string | undefined;
+    let violations: Effect[] = [];
+    const result = this.log.appendGuarded("COMMIT", () => {
+      const auth = this.findAuthorize(p.receipt_id);
+      if (!auth) return { error: `unknown receipt ${p.receipt_id}` };
+      if (this.findCommit(p.receipt_id)) return { error: `receipt ${p.receipt_id} cannot be committed: state is 'committed'` };
+      const st = this.status(p.receipt_id, now).state as string;
+      const lateOk = p.late && (st === "expired" || st === "revoked");
+      if (st !== "ready" && !lateOk) return { error: `receipt ${p.receipt_id} cannot be committed: state is '${st}'` };
 
-    const authorized = auth.data.effects as Effect[];
-    const observed = p.effects ?? [];
-    const violations = observed.filter((o) => !authorized.some((a) => a.type === o.type && a.environment === o.environment && matchGlob(a.resource, o.resource)));
-    const entry = this.log.append("COMMIT", {
-      receipt_id: p.receipt_id,
-      outcome: p.outcome,
-      observed_effects: observed,
-      violations,
-      note: p.note,
-      ...(st !== "ready" ? { receipt_state: st } : {}),
+      const authorized = auth.data.effects as Effect[];
+      const observed = p.effects ?? [];
+      violations = observed.filter((o) => !authorized.some((a) => a.type === o.type && a.environment === o.environment && matchGlob(a.resource, o.resource)));
+      state = st;
+      return {
+        data: {
+          receipt_id: p.receipt_id,
+          outcome: p.outcome,
+          observed_effects: observed,
+          violations,
+          note: p.note,
+          ...(st !== "ready" ? { receipt_state: st } : {}),
+        },
+      };
     });
+    if (result.error) throw new Error(result.error);
+    const entry = result.entry!;
+    const st = state!;
     return {
       commit_id: `cmt_${entry.hash.slice(0, 16)}`,
       status: violations.length || st === "revoked" ? "violation" : "recorded",
@@ -195,6 +213,7 @@ function describeScope(chain: Grant[]): string {
 function validateShape(r: AuthorizeRequest): string | undefined {
   const str = (v: unknown) => typeof v === "string" && v.length > 0;
   if (!str(r.agent) || !str(r.principal) || !str(r.requested_action)) return "agent, principal and requested_action are required";
+  if (!canonicalAction(r.requested_action)) return "requested_action must be a canonical action name (letters, digits, '.', '-', '_' or '/')";
   if (!Array.isArray(r.effects)) return "effects must be an array (use [] for none)";
   for (const e of r.effects) if (!str(e?.type) || !str(e?.resource)) return "each effect needs a type and a resource";
   if (!Array.isArray(r.delegation_chain)) return "delegation_chain must be an array";

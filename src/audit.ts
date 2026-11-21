@@ -1,5 +1,5 @@
 import {
-  appendFileSync, closeSync, existsSync, fstatSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, statSync, truncateSync, unlinkSync, writeFileSync,
+  appendFileSync, closeSync, fstatSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, statSync, truncateSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -82,7 +82,33 @@ export class AuditLog {
   }
 
   append(type: EntryType, data: Record<string, unknown>): AuditEntry {
+    return this.withLock(() => this.appendUnlocked(type, data));
+  }
+
+  /**
+   * Run a state check and append as one locked operation. `build` sees the
+   * freshest log and may veto the append with an error. This closes races where
+   * two server processes both observe `ready` and commit the same receipt (F5).
+   */
+  appendGuarded(
+    type: EntryType,
+    build: () => { data: Record<string, unknown> } | { error: string },
+  ): { entry?: AuditEntry; error?: string } {
     return this.withLock(() => {
+      this.cache = undefined; // another process may have appended since our last parse
+      const built = build();
+      if ("error" in built) return { error: built.error };
+      return { entry: this.appendUnlocked(type, built.data) };
+    });
+  }
+
+  /** Drop a stale parse so the next read sees writes from another process. */
+  refresh(): void {
+    this.cache = undefined;
+  }
+
+  private appendUnlocked(type: EntryType, data: Record<string, unknown>): AuditEntry {
+    {
       const loaded = this.load();
       const entries = this.read();
       const last = entries[entries.length - 1];
@@ -106,7 +132,7 @@ export class AuditLog {
       this.writeHead(entry);
       this.remember(loaded, entry, loaded.goodBytes + Buffer.byteLength(line));
       return entry;
-    });
+    }
   }
 
   verify(): VerifyResult {
@@ -129,7 +155,6 @@ export class AuditLog {
 
     const warnings: string[] = [];
     if (l.torn) warnings.push("the log ends in an incomplete line from an interrupted write; it is ignored and removed by the next append");
-    if (entries.length && !existsSync(this.headPath)) warnings.push("no signed head (audit.head) yet, so entries removed from the end of the log could not be detected; the next append writes one");
     return { valid: true, entries: entries.length, ...(warnings.length ? { warning: warnings.join("; ") } : {}) };
   }
 
@@ -175,14 +200,17 @@ export class AuditLog {
   /**
    * Compare the log with its signed head. The log may run ahead of the head
    * (a crash between the two writes) but must still contain the head's entry.
-   * A missing head file is accepted: logs written before 0.1.2 have none.
+   * A missing head is only acceptable for an empty log: with entries present it
+   * would let someone truncate the tail and still verify clean (F6).
    */
   private checkHead(entries: AuditEntry[]): string | undefined {
     let text: string;
     try {
       text = readFileSync(this.headPath, "utf-8");
     } catch (err) {
-      return (err as NodeJS.ErrnoException).code === "ENOENT" ? undefined : "audit.head is unreadable";
+      return (err as NodeJS.ErrnoException).code === "ENOENT"
+        ? (entries.length ? `no signed head (audit.head) but the log holds ${entries.length} entries; truncation cannot be detected` : undefined)
+        : "audit.head is unreadable";
     }
     let head: Head;
     try { head = JSON.parse(text) as Head; } catch { return "audit.head is unreadable"; }

@@ -71,6 +71,24 @@ describe("MCP stdio", () => {
     assert.deepEqual((await call("atlas_verify_audit", {})).body, { valid: true, entries: 4 });
   });
 
+  it("accepts a late commit over MCP after the grant was revoked", async () => {
+    const grant = JSON.parse(execFileSync(process.execPath, [BIN, "grant", "--principal", "user:tj", "--subject", "agent:claude", "--allow", "db.*", "--env", "staging"], { env: { ...process.env, ATLAS_MCP_DATA_DIR: dir } }).toString());
+    const effects = [{ type: "read", resource: "postgres://staging/users", environment: "staging" }];
+    const auth = await call("atlas_authorize", { agent: "agent:claude", principal: "user:tj", requested_action: "db.read", effects, delegation_chain: [grant.id] });
+    assert.equal(auth.body.decision, "permit");
+    execFileSync(process.execPath, [BIN, "revoke", grant.id], { env: { ...process.env, ATLAS_MCP_DATA_DIR: dir } });
+
+    const normal = await call("atlas_commit_effect", { receipt_id: auth.body.receipt_id, outcome: "success", effects });
+    assert.equal(normal.isError, true);
+    assert.match(normal.body.error, /revoked/);
+
+    const late = await call("atlas_commit_effect", { receipt_id: auth.body.receipt_id, outcome: "success", effects, late: true });
+    assert.equal(late.isError, undefined);
+    assert.equal(late.body.status, "violation");
+    assert.equal(late.body.receipt_state, "revoked");
+    assert.equal((await call("atlas_verify_audit", {})).body.valid, true);
+  });
+
   it("reports bad arguments as tool errors and unknown tools as protocol errors", async () => {
     assert.equal((await call("atlas_authorize", { agent: "x" })).isError, true);
     assert.ok((await call("nope", {})).error);

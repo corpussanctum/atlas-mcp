@@ -132,7 +132,7 @@ Edit `~/.atlas-mcp/hook.json`:
 
 * **This is a gate the agent consults, not a sandbox.** On its own, an MCP tool cannot stop an agent that decides not to call it, or that lies about its effects. v0.1 gives you a signed, verifiable record and a decision to enforce *with*: for Claude Code, use the hook above to make it binding; elsewhere pair it with a tool proxy or network/credential isolation. `atlas_commit_effect` catches and records the mismatches it is told about.
 * The issuer key sits unencrypted in `~/.atlas-mcp/issuer.json` (mode 0600). Protect the directory like an SSH key. Anyone who can read it can forge grants.
-* **The audit log detects edits, removals and reordering; truncation only partly.** A signed head (`audit.head`) records the newest entry, so `verify` notices entries cut from the end, and Atlas refuses to authorize on top of a shortened log. Someone who deletes the head file as well leaves a shorter log that still verifies (with a warning). For stronger evidence, copy `audit.head` somewhere the agent's account cannot write.
+* **The audit log detects edits, removals, reordering and truncation.** A signed head (`audit.head`) records the newest entry, so `verify` notices entries cut from the end, and Atlas refuses to authorize or append on top of a shortened log. Deleting the head file from a non-empty log is also a hard verification failure. Keep `audit.head` somewhere the agent's account cannot write for stronger evidence.
 * Local operator approval = local shell access. There is no remote approval channel in v0.1.
 * Not a compliance certification. Cryptographic choices follow the parent project's assumptions; no external audit has been done.
 
