@@ -63,3 +63,34 @@ export class Issuer {
     }
   }
 }
+
+/**
+ * Observer keys are separate from the Atlas issuer: an enforcement point signs
+ * what it observed with a key the agent cannot read. The Atlas operator keeps
+ * only the public half in `enforcement.json`.
+ */
+export function generateObserverKey(): { public_key_b64: string; secret_key_b64: string } {
+  const kp = ml_dsa65.keygen(randomBytes(32));
+  return {
+    public_key_b64: Buffer.from(kp.publicKey).toString("base64"),
+    secret_key_b64: Buffer.from(kp.secretKey).toString("base64"),
+  };
+}
+
+export function signObserverMessage(secretKeyB64: string, message: string): string {
+  return Buffer.from(
+    ml_dsa65.sign(Buffer.from(secretKeyB64, "base64"), new TextEncoder().encode(message)),
+  ).toString("base64");
+}
+
+export function verifyObserverSignature(publicKeyB64: string, message: string, signatureB64: string): boolean {
+  try {
+    return ml_dsa65.verify(
+      Buffer.from(publicKeyB64, "base64"),
+      new TextEncoder().encode(message),
+      Buffer.from(signatureB64, "base64"),
+    );
+  } catch {
+    return false;
+  }
+}

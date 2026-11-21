@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { matchAction } from "./actions.js";
 import { canonical } from "./canonical.js";
 import { covers } from "./glob.js";
 import type { AuditLog } from "./audit.js";
@@ -129,7 +130,7 @@ export function verifyChain(
 /** Describe how `child` grants more than `parent`, or undefined if it only narrows. */
 function widening(parent: Scope, child: Scope): string | undefined {
   for (const a of child.allow) {
-    if (!parent.allow.some((p) => covers(p, a))) return `action '${a}' not allowed by parent`;
+    if (!matchAction(parent.allow, a)) return `action '${a}' not allowed by parent`;
   }
   if (parent.environments && child.environments) {
     const extra = child.environments.find((e) => !parent.environments!.includes(e));

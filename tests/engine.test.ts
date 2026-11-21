@@ -55,6 +55,32 @@ describe("authorize", () => {
     assert.match(ask("db.drop", [], [g.id]).reason, /explicitly denied/);
   });
 
+  it("normalizes action names so case and whitespace cannot bypass a deny", () => {
+    const g = grant("user:tj", "agent:a", { allow: ["*"], deny: ["db.delete"] });
+    for (const spelling of ["DB.DELETE", "db.delete ", "  Db.Delete  ", "db.DELETE"]) {
+      const r = ask(spelling, [], [g.id]);
+      assert.equal(r.decision, "deny", spelling);
+      assert.match(r.reason, /explicitly denied/, spelling);
+    }
+    // The audit trail keeps what was asked for and the form that was matched.
+    const last = log.read().at(-1)!;
+    assert.equal(last.data.canonical_action, "db.delete");
+    assert.equal(last.data.requested_action, "db.DELETE");
+  });
+
+  it("rejects action names that are not identifiers", () => {
+    const g = grant("user:tj", "agent:a", { allow: ["*"] });
+    for (const spelling of ["db. delete", "db delete", "", "  ", "db/../delete?x=1"]) {
+      assert.equal(ask(spelling, [], [g.id]).decision, "deny", spelling);
+    }
+  });
+
+  it("normalizes action patterns when checking that a child grant widens its parent", () => {
+    const parent = grant("user:tj", "agent:orch", { allow: ["db.READ"] });
+    const child = grant("agent:orch", "agent:worker", { allow: ["DB.Read"] });
+    assert.equal(ask("db.read", [], [parent.id, child.id], "agent:worker").decision, "permit");
+  });
+
   it("denies resources outside the resource scope", () => {
     const g = grant("user:tj", "agent:a", { allow: ["db.*"], resources: ["db://staging/*"] });
     assert.equal(ask("db.read", [eff("read", "staging", "db://prod/users")], [g.id]).decision, "deny");
@@ -176,6 +202,45 @@ describe("escalation, commit, receipts", () => {
     assert.throws(() => engine.commit({ receipt_id: r.receipt_id, outcome: "success" }), /committed/);
     const r2 = ask("db.read", [eff("read", "staging")], [g.id]);
     assert.throws(() => engine.commit({ receipt_id: r2.receipt_id, outcome: "success" }, new Date(Date.now() + 20 * 60_000)), /expired/);
+  });
+
+  it("does not double-commit when another engine has a stale cached view", () => {
+    const g = grant("user:tj", "agent:a", { allow: ["db.*"] });
+    const r = ask("db.read", [eff("read", "staging")], [g.id]);
+    // A second engine has its own cached view of the log, as a second server
+    // process would. Both observe `ready` before either appends.
+    const other = new Engine(issuer, new AuditLog(dir, issuer));
+    assert.equal(engine.commit({ receipt_id: r.receipt_id, outcome: "success", effects: [eff("read", "staging")] }).status, "recorded");
+    assert.throws(() => other.commit({ receipt_id: r.receipt_id, outcome: "success" }), /committed/);
+    assert.equal(log.read().filter((e) => e.type === "COMMIT" && e.data.receipt_id === r.receipt_id).length, 1);
+  });
+
+  it("serializes commits from two processes", async () => {
+    const g = grant("user:tj", "agent:a", { allow: ["db.*"] });
+    const r = ask("db.read", [eff("read", "staging")], [g.id]);
+    const src = resolve(dirname(fileURLToPath(import.meta.url)), "..", "src");
+    const code = `
+      import { AuditLog } from ${JSON.stringify(join(src, "audit.js"))};
+      import { Engine } from ${JSON.stringify(join(src, "engine.js"))};
+      import { Issuer } from ${JSON.stringify(join(src, "keys.js"))};
+      const d = process.env.ATLAS_DIR;
+      const issuer = Issuer.loadOrCreate(d);
+      const engine = new Engine(issuer, new AuditLog(d, issuer));
+      try {
+        const c = engine.commit({ receipt_id: process.env.RECEIPT, outcome: "success" });
+        console.log("OK", c.status);
+      } catch (e) { console.log("ERR", e.message); process.exitCode = 3; }
+    `;
+    const run = () => new Promise<{ code: number | null; out: string }>((done) => {
+      const p = spawn(process.execPath, ["--input-type=module", "-e", code], { env: { ...process.env, ATLAS_DIR: dir, RECEIPT: r.receipt_id } });
+      let out = "";
+      p.stdout.on("data", (c) => { out += c; });
+      p.stderr.resume();
+      p.on("exit", (c) => done({ code: c, out }));
+    });
+    const results = await Promise.all([run(), run()]);
+    assert.deepEqual(results.map((x) => x.code).sort(), [0, 3], JSON.stringify(results));
+    assert.equal(log.read().filter((e) => e.type === "COMMIT" && e.data.receipt_id === r.receipt_id).length, 1);
   });
 
   it("flags effects the receipt never authorized", () => {
@@ -333,15 +398,24 @@ describe("audit log: truncation, interrupted writes, corruption", () => {
     assert.deepEqual(log.verify(), { valid: true, entries: 4 });
   });
 
-  it("warns about a log with no head (written before the head existed), then adopts one", () => {
+  it("fails verification and refuses appends when a non-empty log has no head", () => {
     const g = seed();
     unlinkSync(log.headPath);
     const v = log.verify();
-    assert.equal(v.valid, true);
-    assert.match(v.warning!, /no signed head/);
-    ask("y", [], [g.id]);
-    assert.ok(existsSync(log.headPath));
-    assert.deepEqual(log.verify(), { valid: true, entries: 3 });
+    assert.equal(v.valid, false);
+    assert.match(v.reason!, /no signed head/);
+    assert.equal(lines().length, 2, "truncation must not be buried by a new entry");
+    assert.throws(() => ask("y", [], [g.id]), /integrity check.*no signed head/);
+    // An empty log may still acquire its first head normally.
+    const fresh = mkdtempSync(join(tmpdir(), "atlas-mcp-headless-"));
+    try {
+      const issuer2 = Issuer.loadOrCreate(fresh);
+      const log2 = new AuditLog(fresh, issuer2);
+      assert.deepEqual(log2.verify(), { valid: true, entries: 0 });
+      log2.append("GRANT", { id: "x" });
+      assert.ok(existsSync(log2.headPath));
+      assert.equal(log2.verify().valid, true);
+    } finally { rmSync(fresh, { recursive: true, force: true }); }
   });
 
   it("survives an interrupted final write and repairs it on the next append", () => {

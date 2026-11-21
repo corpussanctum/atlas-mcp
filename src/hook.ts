@@ -73,7 +73,7 @@ const BUILTIN: HookRule[] = [
  */
 export function isExempt(tool: string): boolean {
   return /^(Read|Glob|Grep|LS|TodoWrite|ExitPlanMode|Task|BashOutput|KillShell)$/.test(tool)
-    || /^mcp__atlas(-mcp)?__atlas_(authorize|commit_effect|receipt_status|verify_audit)$/.test(tool);
+    || /^mcp__atlas(-mcp)?__atlas_(authorize|commit_effect|receipt_status|pending_permits|verify_audit)$/.test(tool);
 }
 
 /** The Atlas CLI subcommands that change authority; only the human operator may run them. */

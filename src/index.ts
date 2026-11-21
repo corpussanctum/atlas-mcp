@@ -6,7 +6,8 @@ import { parseArgs } from "node:util";
 import { AuditLog } from "./audit.js";
 import { Engine } from "./engine.js";
 import { issueGrant, revokeGrant, type Scope } from "./grants.js";
-import { Issuer } from "./keys.js";
+import { generateObserverKey, Issuer } from "./keys.js";
+import type { EnforcementConfig } from "./effects/contract.js";
 import { serve } from "./server.js";
 import { isExempt, loadHookConfig, postHook, preHook, selfProtection, type HookConfig, type HookInput } from "./hook.js";
 import { VERSION } from "./version.js";
@@ -21,7 +22,10 @@ const HELP = `atlas-mcp ${VERSION}: pre-action authorization for AI agents
   atlas-mcp resolve <receipt_id> approve|reject [--by NAME] [--note ..]
                                     human decision on an escalated receipt
   atlas-mcp status <receipt_id>
+  atlas-mcp pending [--older-than-ms N]
+                                    list uncommitted permits (exit 1 if any alert)
   atlas-mcp verify                  verify the audit hash chain and signatures
+  atlas-mcp observer-keygen         print a base64 ML-DSA-65 observer keypair for F1 attestations
   atlas-mcp hook init [--principal P] [--env dev,staging]
                                     set up the Claude Code hook (config + grant); prints settings.json
   atlas-mcp hook pre|post           hook entry points (read the Claude Code event on stdin)
@@ -32,10 +36,17 @@ Data dir: $ATLAS_MCP_DATA_DIR (default ~/.atlas-mcp)
 
 const list = (s?: string) => (s ? s.split(",").map((x) => x.trim()).filter(Boolean) : undefined);
 
+/** F1 policy lives with the operator, outside the agent's write scope. */
+function loadEnforcement(dataDir: string): EnforcementConfig {
+  if (process.env.ATLAS_MCP_ENFORCEMENT) return JSON.parse(process.env.ATLAS_MCP_ENFORCEMENT) as EnforcementConfig;
+  const path = join(dataDir, "enforcement.json");
+  return existsSync(path) ? JSON.parse(readFileSync(path, "utf-8")) as EnforcementConfig : { mode: "declared" };
+}
+
 function open(dataDir: string) {
   const issuer = Issuer.loadOrCreate(dataDir);
   const log = new AuditLog(dataDir, issuer);
-  return { issuer, log, engine: new Engine(issuer, log) };
+  return { issuer, log, engine: new Engine(issuer, log, loadEnforcement(dataDir)) };
 }
 
 async function main(): Promise<number> {
@@ -45,6 +56,7 @@ async function main(): Promise<number> {
     principal: { type: "string" }, subject: { type: "string" }, allow: { type: "string" }, deny: { type: "string" },
     escalate: { type: "string" }, env: { type: "string" }, resources: { type: "string" }, "ttl-hours": { type: "string" },
     reason: { type: "string" }, by: { type: "string" }, note: { type: "string" }, force: { type: "boolean" },
+    "older-than-ms": { type: "string" },
   } as const;
   const { values, positionals } = parseArgs({ args: rest, options: opts, allowPositionals: true });
 
@@ -73,6 +85,14 @@ async function main(): Promise<number> {
     }
     case "status":
       console.log(JSON.stringify(open(dataDir).engine.status(positionals[0]), null, 2));
+      return 0;
+    case "pending": {
+      const pending = open(dataDir).engine.pendingPermits(new Date(), Number(values["older-than-ms"] ?? 0));
+      console.log(JSON.stringify(pending, null, 2));
+      return pending.some((p) => p.alert) ? 1 : 0;
+    }
+    case "observer-keygen":
+      console.log(JSON.stringify(generateObserverKey(), null, 2));
       return 0;
     case "verify": {
       const r = open(dataDir).log.verify();
